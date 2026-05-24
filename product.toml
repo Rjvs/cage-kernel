@@ -24,6 +24,7 @@ prepare = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py prepar
 verify = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py verify"
 install-local = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py install-local"
 acceptance = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py acceptance"
+diagnose-dns = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py diagnose-dns"
 release-dry-run = "./tools/repo/release cage-kernel"
 
 [docs]

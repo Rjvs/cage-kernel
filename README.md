@@ -57,14 +57,48 @@ Generated checkouts and build products are written under
 ./tools/repo/run cage-kernel verify
 ./tools/repo/run cage-kernel install-local
 ./tools/repo/run cage-kernel acceptance
+./tools/repo/run --raw cage-kernel diagnose-dns
 ```
 
 `prepare` creates or refreshes `.local/cage-kernel/containerization`, checks out
 the pinned upstream revision, resets that managed checkout, and applies the
 hotplug guest patch.
 
-`build` runs `prepare`, then runs `make` in the upstream `kernel/` directory and
-verifies the resulting `.local/cage-kernel/containerization/kernel/vmlinux`.
+`build` runs `prepare`, then performs the same steps as the upstream
+`kernel/Makefile`: build the `kernel-build:0.1` image, download
+`source.tar.xz` from kernel.org when missing, run `build.sh` in the build
+container, and verify the resulting
+`.local/cage-kernel/containerization/kernel/vmlinux`.
+
+On macOS, `build` discovers host DNS servers from `scutil --dns` and passes
+them to both `container build` and `container run` with `--dns`. This avoids a
+known Apple `container` failure mode where containers get `/etc/resolv.conf`
+pointing at the default NAT gateway, such as `192.168.73.1`, but that resolver
+cannot resolve `ports.ubuntu.com` for the Ubuntu package install in the build
+image.
+
+Some Apple `container` versions do not apply `container build --dns` to an
+already-running BuildKit builder. When the image build fails, `cage-kernel`
+falls back to a direct `ubuntu:focal` build container with the same package
+recipe and explicit DNS, without stopping, deleting, or recreating the global
+builder.
+
+If automatic DNS discovery is wrong for your network, pass one or more explicit
+DNS servers:
+
+```bash
+./tools/repo/run --raw cage-kernel build --dns 10.2.1.1
+./tools/repo/run --raw cage-kernel acceptance --dns 10.2.1.1
+```
+
+`diagnose-dns` prints the discovered host DNS servers, Apple `container`
+service and builder status, and compares default container DNS with explicit
+host DNS:
+
+```bash
+./tools/repo/run --raw cage-kernel diagnose-dns
+./tools/repo/run --raw cage-kernel diagnose-dns --dns 10.2.1.1
+```
 
 `install-local` copies the verified kernel to
 `app/isolate/cage/.local/vmlinux`, the source-checkout location Cage probes

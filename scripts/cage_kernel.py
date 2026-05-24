@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import compileall
 import gzip
+import ipaddress
 import os
 import re
 import shutil
@@ -25,6 +26,27 @@ DEFAULT_CONTAINERIZATION_URL = "https://github.com/apple/containerization.git"
 DEFAULT_CONTAINERIZATION_REVISION = "25558e6b85251104b13d9ae91b5721c071052047"
 PATCH_PATH = UNIT_ROOT / "patches" / "containerization-hotplug-guest.patch"
 DEFAULT_INSTALL_PATH = REPO_ROOT / "app" / "isolate" / "cage" / ".local" / "vmlinux"
+KERNEL_SOURCE_URL = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.5.tar.xz"
+KERNEL_BUILD_IMAGE = "kernel-build:0.1"
+KERNEL_BUILD_BASE_IMAGE = "ubuntu:focal"
+UBUNTU_DNS_PROBE_IMAGE = "ubuntu:focal"
+UBUNTU_DNS_PROBE_HOSTS = ("ports.ubuntu.com", "archive.ubuntu.com")
+KERNEL_BUILD_PACKAGES = (
+    "autoconf",
+    "bc",
+    "binutils-multiarch",
+    "binutils-aarch64-linux-gnu",
+    "bison",
+    "flex",
+    "gcc",
+    "xz-utils",
+    "gcc-aarch64-linux-gnu",
+    "git",
+    "libncurses-dev",
+    "make",
+    "openssl",
+    "python-is-python3",
+)
 LIVE_VOLUME_INTEGRATION_TEST = (
     "tests/integration/test_containerkit_live_volumes.py::"
     "TestContainerKitLiveVolumes::test_direct_ext4_volume_live_attach_persists"
@@ -67,12 +89,28 @@ def run(
     )
 
 
+def run_probe(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    display = " ".join(argv)
+    print(f"+ {display}", flush=True)
+    return subprocess.run(
+        argv,
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def managed_checkout(args: argparse.Namespace) -> Path:
     return args.work_dir.resolve() / "containerization"
 
 
 def built_kernel_path(args: argparse.Namespace) -> Path:
     return managed_checkout(args) / "kernel" / "vmlinux"
+
+
+def kernel_dir(args: argparse.Namespace) -> Path:
+    return managed_checkout(args) / "kernel"
 
 
 def ensure_safe_work_dir(work_dir: Path) -> None:
@@ -177,6 +215,201 @@ def verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_scutil_nameservers(output: str) -> list[str]:
+    return [
+        match.group(1)
+        for match in re.finditer(r"^\s*nameserver\[\d+\]\s*:\s*(\S+)\s*$", output, re.MULTILINE)
+    ]
+
+
+def read_macos_nameservers() -> list[str]:
+    try:
+        proc = subprocess.run(
+            ["scutil", "--dns"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return parse_scutil_nameservers(proc.stdout)
+
+
+def read_resolv_conf_nameservers() -> list[str]:
+    try:
+        lines = Path("/etc/resolv.conf").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    servers: list[str] = []
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) >= 2 and parts[0] == "nameserver":
+            servers.append(parts[1])
+    return servers
+
+
+def sanitize_nameservers(candidates: list[str] | tuple[str, ...]) -> list[str]:
+    servers: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        try:
+            ip = ipaddress.ip_address(raw.strip())
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            continue
+        text = str(ip)
+        if text in seen:
+            continue
+        seen.add(text)
+        servers.append(text)
+    return servers
+
+
+def discovered_nameservers() -> list[str]:
+    if sys.platform == "darwin":
+        return sanitize_nameservers(read_macos_nameservers())
+    return sanitize_nameservers(read_resolv_conf_nameservers())
+
+
+def build_nameservers(args: argparse.Namespace) -> list[str]:
+    explicit = getattr(args, "dns", None)
+    if explicit:
+        servers = sanitize_nameservers(tuple(explicit))
+        if len(servers) != len(explicit):
+            print(
+                "Ignoring invalid, duplicate, or unsafe --dns values",
+                file=sys.stderr,
+            )
+        if servers:
+            return servers
+        raise SystemExit("no usable --dns values were provided")
+    return discovered_nameservers()
+
+
+def dns_args(nameservers: list[str]) -> list[str]:
+    command: list[str] = []
+    for nameserver in nameservers:
+        command.extend(["--dns", nameserver])
+    return command
+
+
+def kernel_git_version(kernel: Path) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(kernel), "rev-parse", "--short=12", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return "unknown"
+    return proc.stdout.strip() or "unknown"
+
+
+def report_container_dns_failure(exc: subprocess.CalledProcessError, nameservers: list[str]) -> None:
+    rendered = ", ".join(nameservers) if nameservers else "none"
+    print(
+        "container command failed during kernel build. "
+        f"DNS servers passed to `container`: {rendered}. "
+        "If apt reported name resolution failures, retry with one or more explicit "
+        "`--dns <ip>` values or run `diagnose-dns`.",
+        file=sys.stderr,
+    )
+    print(
+        f"failed command: {' '.join(str(part) for part in exc.cmd)}",
+        file=sys.stderr,
+    )
+
+
+def build_kernel_image(kernel: Path, nameservers: list[str]) -> None:
+    command = [
+        "container",
+        "build",
+        *dns_args(nameservers),
+        "-f",
+        "image/Dockerfile",
+        "-t",
+        KERNEL_BUILD_IMAGE,
+        "image/",
+    ]
+    run(command, cwd=kernel)
+
+
+def ensure_kernel_source(kernel: Path) -> None:
+    source = kernel / "source.tar.xz"
+    if not source.exists():
+        run(["curl", "-SsL", "-o", "source.tar.xz", KERNEL_SOURCE_URL], cwd=kernel)
+
+
+def run_kernel_build_with_image(kernel: Path, nameservers: list[str]) -> None:
+    command = [
+        "container",
+        "run",
+        *dns_args(nameservers),
+        "--cpus",
+        "8",
+        "--rm",
+        "--memory",
+        "16g",
+        "-v",
+        f"{kernel}:/kernel",
+        "--env",
+        f"LOCALVERSION=-cz-{kernel_git_version(kernel)}",
+        "--cwd",
+        "/kernel",
+        KERNEL_BUILD_IMAGE,
+        "/bin/bash",
+        "-c",
+        "./build.sh",
+    ]
+    run(command, cwd=kernel)
+
+
+def direct_toolchain_script() -> str:
+    packages = " ".join(KERNEL_BUILD_PACKAGES)
+    return " && ".join(
+        [
+            "export DEBIAN_FRONTEND=noninteractive",
+            "apt-get update",
+            f"apt-get install -y {packages}",
+            "apt-get clean",
+            "rm -rf /var/lib/apt/lists/*",
+            "cp /kernel/image/sources.list /etc/apt/sources.list",
+            "apt-get update",
+            "dpkg --add-architecture arm64",
+            "apt-get install -y libelf-dev:arm64",
+            "apt-get clean",
+            "rm -rf /var/lib/apt/lists/*",
+            "./build.sh",
+        ]
+    )
+
+
+def run_kernel_build_direct(kernel: Path, nameservers: list[str]) -> None:
+    command = [
+        "container",
+        "run",
+        *dns_args(nameservers),
+        "--cpus",
+        "8",
+        "--rm",
+        "--memory",
+        "16g",
+        "-v",
+        f"{kernel}:/kernel",
+        "--env",
+        f"LOCALVERSION=-cz-{kernel_git_version(kernel)}",
+        "--cwd",
+        "/kernel",
+        KERNEL_BUILD_BASE_IMAGE,
+        "/bin/bash",
+        "-lc",
+        direct_toolchain_script(),
+    ]
+    run(command, cwd=kernel)
+
+
 def build(args: argparse.Namespace) -> int:
     if shutil.which("container") is None:
         raise SystemExit(
@@ -184,7 +417,27 @@ def build(args: argparse.Namespace) -> int:
         )
     if not args.no_prepare:
         prepare(args)
-    run(["make"], cwd=managed_checkout(args) / "kernel")
+    nameservers = build_nameservers(args)
+    rendered = ", ".join(nameservers) if nameservers else "container defaults"
+    print(f"Using container DNS servers: {rendered}")
+    kernel = kernel_dir(args)
+    try:
+        ensure_kernel_source(kernel)
+        try:
+            build_kernel_image(kernel, nameservers)
+        except subprocess.CalledProcessError as exc:
+            report_container_dns_failure(exc, nameservers)
+            print(
+                "Falling back to direct Ubuntu build container with explicit DNS; "
+                "this uses the same package recipe as the upstream Dockerfile.",
+                file=sys.stderr,
+            )
+            run_kernel_build_direct(kernel, nameservers)
+        else:
+            run_kernel_build_with_image(kernel, nameservers)
+    except subprocess.CalledProcessError as exc:
+        report_container_dns_failure(exc, nameservers)
+        raise
     verify_kernel(built_kernel_path(args))
     return 0
 
@@ -218,6 +471,49 @@ def acceptance(args: argparse.Namespace) -> int:
     return 0
 
 
+def probe_dns(nameservers: list[str]) -> subprocess.CompletedProcess[str]:
+    script = "cat /etc/resolv.conf; " + "; ".join(
+        f"getent hosts {host}" for host in UBUNTU_DNS_PROBE_HOSTS
+    )
+    command = [
+        "container",
+        "run",
+        *dns_args(nameservers),
+        "--rm",
+        UBUNTU_DNS_PROBE_IMAGE,
+        "/bin/bash",
+        "-lc",
+        script,
+    ]
+    return run_probe(command)
+
+
+def print_probe_result(title: str, proc: subprocess.CompletedProcess[str]) -> None:
+    status = "ok" if proc.returncode == 0 else f"failed ({proc.returncode})"
+    print(f"\n== {title}: {status} ==")
+    output = proc.stdout.strip()
+    error = proc.stderr.strip()
+    if output:
+        print(output)
+    if error:
+        print(error)
+
+
+def diagnose_dns(args: argparse.Namespace) -> int:
+    if shutil.which("container") is None:
+        raise SystemExit("`container` CLI is required for DNS diagnostics")
+
+    nameservers = build_nameservers(args)
+    rendered = ", ".join(nameservers) if nameservers else "none"
+    print(f"Host DNS servers discovered: {rendered}")
+
+    print_probe_result("container system status", run_probe(["container", "system", "status"]))
+    print_probe_result("container builder status", run_probe(["container", "builder", "status"]))
+    print_probe_result("default container DNS probe", probe_dns([]))
+    print_probe_result("explicit host DNS probe", probe_dns(nameservers))
+    return 0
+
+
 def validate_patch_file() -> None:
     text = PATCH_PATH.read_text(encoding="utf-8")
     missing = sorted(line for line in REQUIRED_CONFIG_LINES if line not in text)
@@ -230,6 +526,21 @@ def validate_patch_file() -> None:
 
 def self_test() -> int:
     validate_patch_file()
+    scutil_output = """
+resolver #1
+  nameserver[0] : 10.0.0.1
+  nameserver[1] : 127.0.0.1
+resolver #2
+  nameserver[0] : 10.0.0.1
+  nameserver[1] : fe80::1
+  nameserver[2] : 2001:4860:4860::8888
+"""
+    parsed = parse_scutil_nameservers(scutil_output)
+    if parsed != ["10.0.0.1", "127.0.0.1", "10.0.0.1", "fe80::1", "2001:4860:4860::8888"]:
+        raise AssertionError("failed to parse scutil nameservers")
+    sanitized = sanitize_nameservers(parsed)
+    if sanitized != ["10.0.0.1", "2001:4860:4860::8888"]:
+        raise AssertionError("failed to sanitize nameservers")
     config = "\n".join(["# CONFIG_TEST=y", *sorted(REQUIRED_CONFIG_LINES), ""]) + "\n"
     plain = b"prefix IKCFG_ST" + config.encode() + b"IKCFG_ED suffix"
     compressed = b"prefix IKCFG_ST" + gzip.compress(config.encode()) + b"IKCFG_ED suffix"
@@ -305,6 +616,12 @@ def parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         add_common_options(command)
         command.add_argument(
+            "--dns",
+            action="append",
+            default=[],
+            help="DNS nameserver IP to pass to Apple container; may be repeated",
+        )
+        command.add_argument(
             "--no-prepare",
             action="store_true",
             help="reuse the existing prepared checkout",
@@ -320,6 +637,15 @@ def parser() -> argparse.ArgumentParser:
     add_common_options(install_command)
     install_command.add_argument("--kernel", type=Path, help="kernel image to install")
     install_command.set_defaults(handler=install_local)
+
+    diagnose_command = subparsers.add_parser("diagnose-dns")
+    diagnose_command.add_argument(
+        "--dns",
+        action="append",
+        default=[],
+        help="DNS nameserver IP to pass to the explicit DNS probe; may be repeated",
+    )
+    diagnose_command.set_defaults(handler=diagnose_dns)
 
     simple_handlers = {
         "format": format_code,
