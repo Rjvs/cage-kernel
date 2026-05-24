@@ -1,0 +1,31 @@
+name = "cage-kernel"
+kind = "component"
+language = "script"
+status = "active"
+path = "app/isolate/cage-kernel"
+version_file = "VERSION"
+release_tags = ["cage-kernel/v{version}"]
+
+[paths]
+owned = ["app/isolate/cage-kernel/**"]
+shared_dependencies = []
+
+[compatibility]
+consumes = []
+consumed_by = ["cage"]
+
+[commands]
+format = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py format"
+lint = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py lint"
+typecheck = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py typecheck"
+test = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py test"
+build = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py build"
+prepare = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py prepare"
+verify = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py verify"
+install-local = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py install-local"
+acceptance = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py acceptance"
+release-dry-run = "./tools/repo/release cage-kernel"
+
+[docs]
+readme = "README.md"
+changelog = "CHANGELOG.md"
