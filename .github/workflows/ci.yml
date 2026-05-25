@@ -16,8 +16,8 @@ jobs:
     name: Validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
       - name: Run self-test
         run: uv run --script scripts/cage_kernel.py test
       - name: Run lint
@@ -34,8 +34,8 @@ jobs:
       - macOS
       - ARM64
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
       - name: Ensure zstd is available
         run: command -v zstd >/dev/null || brew install zstd
       - name: Build kernel
@@ -43,7 +43,7 @@ jobs:
       - name: Package artifacts
         run: uv run --script scripts/cage_kernel.py package --acceptance-result not_run
       - name: Upload release artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           prerelease: true
           files: |
