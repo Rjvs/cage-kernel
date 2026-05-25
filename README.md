@@ -3,7 +3,9 @@
 ## Purpose And Criticality
 
 `cage-kernel` is the reproducible build unit for the macOS ContainerKit guest
-kernel used by Cage live direct-volume attach.
+kernel used by Cage live direct-volume attach. Public release artifacts are
+published from [`Rjvs/cage-kernel`](https://github.com/Rjvs/cage-kernel); this
+monorepo copy remains the local development and compatibility reference.
 
 Cage can hotplug a direct ext4 volume into a running ContainerKit VM only when
 the guest kernel has SCSI disk, XHCI, USB mass storage, and UAS support. The
@@ -102,7 +104,7 @@ host DNS:
 
 `install-local` copies the verified kernel to
 `app/isolate/cage/.local/vmlinux`, the source-checkout location Cage probes
-before falling back to the Apple `container` CLI kernel cache.
+before the managed public-release cache.
 
 `acceptance` builds, installs, and runs the focused macOS live direct-volume
 integration test with `CAGE_TEST_KERNEL_PATH` set to the installed kernel.
@@ -118,6 +120,7 @@ path; those belong to separate pod/shared-volume investigations.
 
 ## Release Pointer
 
-Releases are tagged as `cage-kernel/v{version}`. A release should record the
-upstream Containerization revision, the guest kernel version built by upstream's
-`kernel/Makefile`, and the live-volume acceptance result.
+Public releases are tagged in `Rjvs/cage-kernel` as `v{version}` and publish
+`vmlinux.zst`, `manifest.json`, and `SHA256SUMS`. The manifest records the
+upstream Containerization revision, Linux source version, patch hash, artifact
+hashes, and live-volume acceptance result.
