@@ -1,0 +1,54 @@
+name: Bless Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "Existing RC tag, for example v0.1.0-rc.1"
+        required: true
+      stable_tag:
+        description: "Stable tag to create, for example v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bless:
+    name: Promote RC Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download RC artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_TAG: ${{ inputs.rc_tag }}
+        run: |
+          mkdir -p dist
+          gh release download "$RC_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir dist \
+            --pattern vmlinux.zst \
+            --pattern manifest.json \
+            --pattern SHA256SUMS
+      - name: Verify downloaded artifacts
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+      - name: Create stable release from RC assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_TAG: ${{ inputs.rc_tag }}
+          STABLE_TAG: ${{ inputs.stable_tag }}
+        run: |
+          target="$(git rev-list -n 1 "$RC_TAG")"
+          gh release create "$STABLE_TAG" \
+            dist/vmlinux.zst \
+            dist/manifest.json \
+            dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$target" \
+            --title "$STABLE_TAG" \
+            --notes "Blessed from $RC_TAG without rebuilding artifacts."
