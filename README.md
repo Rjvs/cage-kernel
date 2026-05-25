@@ -1,3 +1,5 @@
+![Cage](./cage.jpg)
+
 # Cage Kernel
 
 `cage-kernel` builds and publishes the macOS ContainerKit guest kernel used by
