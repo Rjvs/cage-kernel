@@ -6,6 +6,10 @@ path = "app/isolate/cage-kernel"
 version_file = "VERSION"
 release_tags = ["cage-kernel/v{version}"]
 
+[ci]
+pr_runners = ["ubuntu-latest"]
+platform_agnostic = true
+
 [paths]
 owned = ["app/isolate/cage-kernel/**"]
 shared_dependencies = []
