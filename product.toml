@@ -7,7 +7,7 @@ version_file = "VERSION"
 release_tags = ["cage-kernel/v{version}"]
 
 [ci]
-pr_runners = ["ubuntu-latest"]
+pr_runners = ["self-hosted-linux"]
 platform_agnostic = true
 commands = ["lint", "typecheck", "test"]
 
