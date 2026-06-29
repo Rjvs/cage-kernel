@@ -54,12 +54,12 @@ Generated checkouts and build products are written under
 ## Development Commands
 
 ```bash
-./tools/repo/run cage-kernel prepare
-./tools/repo/run cage-kernel build
-./tools/repo/run cage-kernel verify
-./tools/repo/run cage-kernel install-local
-./tools/repo/run cage-kernel acceptance
-./tools/repo/run --raw cage-kernel diagnose-dns
+./tools/run cage-kernel prepare
+./tools/run cage-kernel build
+./tools/run cage-kernel verify
+./tools/run cage-kernel install-local
+./tools/run cage-kernel acceptance
+./tools/run --raw cage-kernel diagnose-dns
 ```
 
 `prepare` creates or refreshes `.local/cage-kernel/containerization`, checks out
@@ -89,8 +89,8 @@ If automatic DNS discovery is wrong for your network, pass one or more explicit
 DNS servers:
 
 ```bash
-./tools/repo/run --raw cage-kernel build --dns 10.2.1.1
-./tools/repo/run --raw cage-kernel acceptance --dns 10.2.1.1
+./tools/run --raw cage-kernel build --dns 10.2.1.1
+./tools/run --raw cage-kernel acceptance --dns 10.2.1.1
 ```
 
 `diagnose-dns` prints the discovered host DNS servers, Apple `container`
@@ -98,8 +98,8 @@ service and builder status, and compares default container DNS with explicit
 host DNS:
 
 ```bash
-./tools/repo/run --raw cage-kernel diagnose-dns
-./tools/repo/run --raw cage-kernel diagnose-dns --dns 10.2.1.1
+./tools/run --raw cage-kernel diagnose-dns
+./tools/run --raw cage-kernel diagnose-dns --dns 10.2.1.1
 ```
 
 `install-local` copies the verified kernel to
