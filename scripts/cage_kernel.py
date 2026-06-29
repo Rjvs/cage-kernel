@@ -461,7 +461,7 @@ def acceptance(args: argparse.Namespace) -> int:
     env["CAGE_TEST_KERNEL_PATH"] = str(args.install_path.resolve(strict=False))
     run(
         [
-            "./tools/repo/run",
+            "./tools/run",
             "cage",
             "test-integration-macos",
             LIVE_VOLUME_INTEGRATION_TEST,
