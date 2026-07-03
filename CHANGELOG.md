@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0
+
+- Add the Containerization #681 CIFS kernel options to the Cage guest config
+  patch and verification requirements so macOS guests can mount cage-storage
+  SMB leases through CIFS.
+
 ## 0.1.0
 
 - Add a reproducible Cage ContainerKit guest-kernel build unit for live direct

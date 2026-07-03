@@ -59,6 +59,12 @@ REQUIRED_CONFIG_LINES = frozenset(
         "CONFIG_USB_XHCI_HCD=y",
         "CONFIG_USB_STORAGE=y",
         "CONFIG_USB_UAS=y",
+        "CONFIG_CIFS=y",
+        "CONFIG_CIFS_ALLOW_INSECURE_LEGACY=y",
+        "CONFIG_CIFS_UPCALL=y",
+        "CONFIG_CIFS_XATTR=y",
+        "CONFIG_CIFS_POSIX=y",
+        "CONFIG_CIFS_DFS_UPCALL=y",
     }
 )
 
