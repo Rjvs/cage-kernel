@@ -9,8 +9,8 @@ monorepo copy remains the local development and compatibility reference.
 
 Cage can hotplug a direct ext4 volume into a running ContainerKit VM only when
 the guest kernel has SCSI disk, XHCI, USB mass storage, and UAS support. Cage
-can mount managed cage-storage shares inside the guest only when the kernel also
-has CIFS support. The current upstream `apple/containerization` framework has
+can mount pod-owned Samba shares inside the guest only when the kernel also has
+CIFS support. The current upstream `apple/containerization` framework has
 the host-side NBD, hotplug, and CIFS userspace surface Cage needs, but its guest
 kernel config still needs this storage/CIFS patch until the options land
 upstream.

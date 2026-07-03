@@ -3,8 +3,8 @@
 ## 0.2.0
 
 - Add the Containerization #681 CIFS kernel options to the Cage guest config
-  patch and verification requirements so macOS guests can mount cage-storage
-  SMB leases through CIFS.
+  patch and verification requirements so macOS guests can mount pod-owned
+  Samba shares through CIFS.
 
 ## 0.1.0
 
