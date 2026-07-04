@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Fail fast when the Apple `container` system service is unavailable instead of
+  reporting a DNS fallback and retrying another container command that cannot
+  succeed.
+
 ## 0.3.0
 
 - Add explicit Cage kernel profiles for the hotplug kernel that `Rjvs/cage-kernel`
