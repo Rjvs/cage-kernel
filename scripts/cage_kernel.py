@@ -40,6 +40,11 @@ KERNEL_BUILD_IMAGE = "kernel-build:0.1"
 KERNEL_BUILD_BASE_IMAGE = "ubuntu:focal"
 UBUNTU_DNS_PROBE_IMAGE = "ubuntu:focal"
 UBUNTU_DNS_PROBE_HOSTS = ("ports.ubuntu.com", "archive.ubuntu.com")
+CONTAINER_SERVICE_FAILURE_MARKERS = (
+    "XPC connection error",
+    "Connection invalid",
+    "container system start",
+)
 KERNEL_BUILD_PACKAGES = (
     "autoconf",
     "bc",
@@ -165,6 +170,30 @@ def run_probe(argv: list[str]) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         check=False,
     )
+
+
+def run_container(argv: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    display = " ".join(argv)
+    print(f"+ {display}", flush=True)
+    proc = subprocess.run(
+        argv,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode,
+            argv,
+            output=proc.stdout,
+            stderr=proc.stderr,
+        )
+    return proc
 
 
 def managed_checkout(args: argparse.Namespace) -> Path:
@@ -435,7 +464,30 @@ def kernel_git_version(kernel: Path) -> str:
     return proc.stdout.strip() or "unknown"
 
 
-def report_container_dns_failure(exc: subprocess.CalledProcessError, nameservers: list[str]) -> None:
+def container_failure_output(exc: subprocess.CalledProcessError) -> str:
+    output = exc.output if isinstance(exc.output, str) else ""
+    stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+    return "\n".join(part for part in (output, stderr) if part)
+
+
+def is_container_service_failure(exc: subprocess.CalledProcessError) -> bool:
+    text = container_failure_output(exc)
+    return any(marker in text for marker in CONTAINER_SERVICE_FAILURE_MARKERS)
+
+
+def report_container_failure(exc: subprocess.CalledProcessError, nameservers: list[str]) -> None:
+    if is_container_service_failure(exc):
+        print(
+            "Apple `container` service is not available. Start it with "
+            "`container system start`, then rerun the cage-kernel command.",
+            file=sys.stderr,
+        )
+        print(
+            f"failed command: {' '.join(str(part) for part in exc.cmd)}",
+            file=sys.stderr,
+        )
+        return
+
     rendered = ", ".join(nameservers) if nameservers else "none"
     print(
         "container command failed during kernel build. "
@@ -461,7 +513,7 @@ def build_kernel_image(kernel: Path, nameservers: list[str]) -> None:
         KERNEL_BUILD_IMAGE,
         "image/",
     ]
-    run(command, cwd=kernel)
+    run_container(command, cwd=kernel)
 
 
 def ensure_kernel_source(kernel: Path) -> None:
@@ -491,7 +543,7 @@ def run_kernel_build_with_image(kernel: Path, nameservers: list[str]) -> None:
         "-c",
         "./build.sh",
     ]
-    run(command, cwd=kernel)
+    run_container(command, cwd=kernel)
 
 
 def direct_toolchain_script() -> str:
@@ -535,7 +587,7 @@ def run_kernel_build_direct(kernel: Path, nameservers: list[str]) -> None:
         "-lc",
         direct_toolchain_script(),
     ]
-    run(command, cwd=kernel)
+    run_container(command, cwd=kernel)
 
 
 def unit_version() -> str:
@@ -742,6 +794,7 @@ def build(args: argparse.Namespace) -> int:
         raise SystemExit(
             "`container` CLI is required to build apple/containerization/kernel"
         )
+    ensure_container_system_available()
     if not args.no_prepare:
         prepare(args)
     nameservers = build_nameservers(args)
@@ -753,17 +806,26 @@ def build(args: argparse.Namespace) -> int:
         try:
             build_kernel_image(kernel, nameservers)
         except subprocess.CalledProcessError as exc:
-            report_container_dns_failure(exc, nameservers)
+            report_container_failure(exc, nameservers)
+            if is_container_service_failure(exc):
+                raise SystemExit(exc.returncode) from exc
             print(
                 "Falling back to direct Ubuntu build container with explicit DNS; "
                 "this uses the same package recipe as the upstream Dockerfile.",
                 file=sys.stderr,
             )
-            run_kernel_build_direct(kernel, nameservers)
+            try:
+                run_kernel_build_direct(kernel, nameservers)
+            except subprocess.CalledProcessError as direct_exc:
+                report_container_failure(direct_exc, nameservers)
+                raise
         else:
-            run_kernel_build_with_image(kernel, nameservers)
+            try:
+                run_kernel_build_with_image(kernel, nameservers)
+            except subprocess.CalledProcessError as exc:
+                report_container_failure(exc, nameservers)
+                raise
     except subprocess.CalledProcessError as exc:
-        report_container_dns_failure(exc, nameservers)
         raise
     source = built_kernel_path(args)
     verify_kernel(source, profile)
@@ -877,6 +939,20 @@ def diagnose_dns(args: argparse.Namespace) -> int:
     return 0
 
 
+def ensure_container_system_available() -> None:
+    proc = run_probe(["container", "system", "status"])
+    if proc.returncode == 0:
+        return
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    raise SystemExit(
+        "Apple `container` system is not available. Start it with "
+        "`container system start`, then rerun the cage-kernel command."
+    )
+
+
 def validate_patch_file() -> None:
     for profile in KERNEL_PROFILES.values():
         for patch in profile.patches:
@@ -910,6 +986,20 @@ resolver #2
     sanitized = sanitize_nameservers(parsed)
     if sanitized != ["10.0.0.1", "2001:4860:4860::8888"]:
         raise AssertionError("failed to sanitize nameservers")
+    service_failure = subprocess.CalledProcessError(
+        1,
+        ["container", "build"],
+        stderr='Error: interrupted: "XPC connection error: Connection invalid"\n',
+    )
+    if not is_container_service_failure(service_failure):
+        raise AssertionError("failed to classify container service failure")
+    dns_failure = subprocess.CalledProcessError(
+        1,
+        ["container", "build"],
+        stderr="Temporary failure resolving 'ports.ubuntu.com'\n",
+    )
+    if is_container_service_failure(dns_failure):
+        raise AssertionError("misclassified DNS failure as container service failure")
     if profile_from_args(argparse.Namespace(profile=DEFAULT_PROFILE_NAME)).name != "hotplug":
         raise AssertionError("failed to resolve default profile")
     if [profile.name for profile in selected_create_profiles(argparse.Namespace(profiles=[]))] != [

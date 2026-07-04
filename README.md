@@ -135,7 +135,14 @@ asset.
 If the release tag already exists, `publish` uploads with `--clobber`. If it
 does not exist, it creates a draft release by default.
 
-On macOS, `build` discovers host DNS servers from `scutil --dns` and passes
+On macOS, `build` first checks that the Apple `container` system service is
+running. If it is not available, start it before building:
+
+```bash
+container system start
+```
+
+After that, `build` discovers host DNS servers from `scutil --dns` and passes
 them to both `container build` and `container run` with `--dns`. This avoids a
 known Apple `container` failure mode where containers get `/etc/resolv.conf`
 pointing at the default NAT gateway, such as `192.168.73.1`, but that resolver
@@ -144,9 +151,9 @@ image.
 
 Some Apple `container` versions do not apply `container build --dns` to an
 already-running BuildKit builder. When the image build fails, `cage-kernel`
-falls back to a direct `ubuntu:focal` build container with the same package
-recipe and explicit DNS, without stopping, deleting, or recreating the global
-builder.
+falls back only for non-service failures to a direct `ubuntu:focal` build
+container with the same package recipe and explicit DNS, without stopping,
+deleting, or recreating the global builder.
 
 If automatic DNS discovery is wrong for your network, pass one or more explicit
 DNS servers:
