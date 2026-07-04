@@ -25,11 +25,13 @@ lint = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py lint"
 typecheck = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py typecheck"
 test = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py test"
 build = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py build"
+create = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py create"
 prepare = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py prepare"
 verify = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py verify"
 install-local = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py install-local"
 acceptance = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py acceptance"
 diagnose-dns = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py diagnose-dns"
+list-profiles = "uv run --script app/isolate/cage-kernel/scripts/cage_kernel.py list-profiles"
 release-dry-run = "./tools/repo/release cage-kernel"
 
 [docs]

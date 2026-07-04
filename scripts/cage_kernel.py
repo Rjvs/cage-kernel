@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import compileall
+import dataclasses
 import gzip
 import ipaddress
 import os
@@ -24,7 +25,11 @@ REPO_ROOT = UNIT_ROOT.parents[2]
 DEFAULT_WORK_DIR = REPO_ROOT / ".local" / "cage-kernel"
 DEFAULT_CONTAINERIZATION_URL = "https://github.com/apple/containerization.git"
 DEFAULT_CONTAINERIZATION_REVISION = "25558e6b85251104b13d9ae91b5721c071052047"
-PATCH_PATH = UNIT_ROOT / "patches" / "containerization-hotplug-guest.patch"
+NBD_PATCH_PATH = UNIT_ROOT / "patches" / "containerization-nbd-guest.patch"
+CIFS_PATCH_PATH = UNIT_ROOT / "patches" / "containerization-cifs-guest.patch"
+DEFAULT_PROFILE_NAME = "nbd-cifs"
+DEFAULT_ARTIFACT_DIR = DEFAULT_WORK_DIR / "kernels"
+DEFAULT_INSTALL_DIR = REPO_ROOT / "app" / "isolate" / "cage" / ".local" / "kernels"
 DEFAULT_INSTALL_PATH = REPO_ROOT / "app" / "isolate" / "cage" / ".local" / "vmlinux"
 KERNEL_SOURCE_URL = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.5.tar.xz"
 KERNEL_BUILD_IMAGE = "kernel-build:0.1"
@@ -51,14 +56,19 @@ LIVE_VOLUME_INTEGRATION_TEST = (
     "tests/integration/test_containerkit_live_volumes.py::"
     "TestContainerKitLiveVolumes::test_direct_ext4_volume_live_attach_persists"
 )
-REQUIRED_CONFIG_LINES = frozenset(
+NBD_CONFIG_LINES = frozenset(
     {
+        "CONFIG_BLK_DEV_NBD=y",
         "CONFIG_SCSI=y",
         "CONFIG_BLK_DEV_SD=y",
         "CONFIG_USB=y",
         "CONFIG_USB_XHCI_HCD=y",
         "CONFIG_USB_STORAGE=y",
         "CONFIG_USB_UAS=y",
+    }
+)
+CIFS_CONFIG_LINES = frozenset(
+    {
         "CONFIG_CIFS=y",
         "CONFIG_CIFS_ALLOW_INSECURE_LEGACY=y",
         "CONFIG_CIFS_UPCALL=y",
@@ -67,6 +77,45 @@ REQUIRED_CONFIG_LINES = frozenset(
         "CONFIG_CIFS_DFS_UPCALL=y",
     }
 )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class KernelPatch:
+    path: Path
+    required_config_lines: frozenset[str]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class KernelProfile:
+    name: str
+    description: str
+    patches: tuple[KernelPatch, ...]
+    required_config_lines: frozenset[str]
+
+
+NBD_PATCH = KernelPatch(NBD_PATCH_PATH, NBD_CONFIG_LINES)
+CIFS_PATCH = KernelPatch(CIFS_PATCH_PATH, CIFS_CONFIG_LINES)
+KERNEL_PROFILES = {
+    "apple": KernelProfile(
+        name="apple",
+        description="stock apple/containerization guest kernel",
+        patches=(),
+        required_config_lines=frozenset(),
+    ),
+    "nbd": KernelProfile(
+        name="nbd",
+        description="Apple guest kernel with Cage NBD/direct-volume support",
+        patches=(NBD_PATCH,),
+        required_config_lines=NBD_CONFIG_LINES,
+    ),
+    "nbd-cifs": KernelProfile(
+        name="nbd-cifs",
+        description="Cage NBD/direct-volume kernel with SMB/CIFS guest mounts",
+        patches=(NBD_PATCH, CIFS_PATCH),
+        required_config_lines=NBD_CONFIG_LINES | CIFS_CONFIG_LINES,
+    ),
+}
+PROFILE_ORDER = ("apple", "nbd", "nbd-cifs")
 
 
 def repo_path(path: Path) -> str:
@@ -119,6 +168,40 @@ def kernel_dir(args: argparse.Namespace) -> Path:
     return managed_checkout(args) / "kernel"
 
 
+def profile_from_args(args: argparse.Namespace) -> KernelProfile:
+    name = getattr(args, "profile", DEFAULT_PROFILE_NAME)
+    try:
+        return KERNEL_PROFILES[name]
+    except KeyError as exc:
+        choices = ", ".join(PROFILE_ORDER)
+        raise SystemExit(f"unknown kernel profile {name!r}; choose one of: {choices}") from exc
+
+
+def profile_artifact_path(args: argparse.Namespace, profile: KernelProfile) -> Path:
+    artifact_dir = getattr(args, "artifact_dir", None) or DEFAULT_ARTIFACT_DIR
+    return artifact_dir.resolve(strict=False) / profile.name / "vmlinux"
+
+
+def default_install_path(profile: KernelProfile) -> Path:
+    if profile.name == DEFAULT_PROFILE_NAME:
+        return DEFAULT_INSTALL_PATH
+    return DEFAULT_INSTALL_DIR / profile.name / "vmlinux"
+
+
+def install_destination(args: argparse.Namespace, profile: KernelProfile) -> Path:
+    install_path = getattr(args, "install_path", None)
+    if install_path is not None:
+        return install_path.resolve(strict=False)
+    return default_install_path(profile).resolve(strict=False)
+
+
+def default_verify_source(args: argparse.Namespace, profile: KernelProfile) -> Path:
+    artifact = profile_artifact_path(args, profile)
+    if artifact.is_file():
+        return artifact
+    return built_kernel_path(args)
+
+
 def ensure_safe_work_dir(work_dir: Path) -> None:
     resolved = work_dir.resolve(strict=False)
     allowed_root = (REPO_ROOT / ".local").resolve()
@@ -136,12 +219,25 @@ def checkout_revision(checkout: Path, revision: str) -> None:
         run(["git", "checkout", "--detach", revision], cwd=checkout)
 
 
-def apply_hotplug_patch(checkout: Path) -> None:
-    run(["git", "apply", "--check", str(PATCH_PATH)], cwd=checkout)
-    run(["git", "apply", str(PATCH_PATH)], cwd=checkout)
+def checkout_config_lines(checkout: Path) -> set[str]:
+    config = checkout / "kernel" / "config-arm64"
+    try:
+        return set(config.read_text(encoding="utf-8").splitlines())
+    except OSError as exc:
+        raise SystemExit(f"could not read {repo_path(config)}: {exc}") from exc
+
+
+def apply_profile_patches(checkout: Path, profile: KernelProfile) -> None:
+    for patch in profile.patches:
+        if patch.required_config_lines <= checkout_config_lines(checkout):
+            print(f"Skipping {repo_path(patch.path)}; required config is already present")
+            continue
+        run(["git", "apply", "--check", str(patch.path)], cwd=checkout)
+        run(["git", "apply", str(patch.path)], cwd=checkout)
 
 
 def prepare(args: argparse.Namespace) -> int:
+    profile = profile_from_args(args)
     ensure_safe_work_dir(args.work_dir)
     args.work_dir.mkdir(parents=True, exist_ok=True)
     checkout = managed_checkout(args)
@@ -163,8 +259,11 @@ def prepare(args: argparse.Namespace) -> int:
     checkout_revision(checkout, args.containerization_revision)
     run(["git", "reset", "--hard", args.containerization_revision], cwd=checkout)
     run(["git", "clean", "-fdx"], cwd=checkout)
-    apply_hotplug_patch(checkout)
-    print(f"Prepared {repo_path(checkout)} at {args.containerization_revision}")
+    apply_profile_patches(checkout, profile)
+    print(
+        f"Prepared {repo_path(checkout)} at {args.containerization_revision} "
+        f"for {profile.name}"
+    )
     return 0
 
 
@@ -204,20 +303,24 @@ def kernel_config_lines(kernel: Path) -> set[str]:
     return set(config.splitlines())
 
 
-def verify_kernel(kernel: Path) -> None:
+def verify_kernel(kernel: Path, profile: KernelProfile) -> None:
     if not kernel.is_file():
         raise SystemExit(f"kernel image not found: {repo_path(kernel)}")
     options = kernel_config_lines(kernel)
-    missing = sorted(REQUIRED_CONFIG_LINES - options)
+    missing = sorted(profile.required_config_lines - options)
     if missing:
         rendered = ", ".join(missing)
-        raise SystemExit(f"{repo_path(kernel)} is missing required config: {rendered}")
-    print(f"{repo_path(kernel)} supports Cage live volume attach")
+        raise SystemExit(
+            f"{repo_path(kernel)} does not satisfy profile {profile.name!r}; "
+            f"missing required config: {rendered}"
+        )
+    print(f"{repo_path(kernel)} satisfies Cage kernel profile {profile.name}")
 
 
 def verify(args: argparse.Namespace) -> int:
-    kernel = args.kernel if args.kernel is not None else built_kernel_path(args)
-    verify_kernel(kernel.resolve(strict=False))
+    profile = profile_from_args(args)
+    kernel = args.kernel if args.kernel is not None else default_verify_source(args, profile)
+    verify_kernel(kernel.resolve(strict=False), profile)
     return 0
 
 
@@ -417,6 +520,7 @@ def run_kernel_build_direct(kernel: Path, nameservers: list[str]) -> None:
 
 
 def build(args: argparse.Namespace) -> int:
+    profile = profile_from_args(args)
     if shutil.which("container") is None:
         raise SystemExit(
             "`container` CLI is required to build apple/containerization/kernel"
@@ -444,27 +548,36 @@ def build(args: argparse.Namespace) -> int:
     except subprocess.CalledProcessError as exc:
         report_container_dns_failure(exc, nameservers)
         raise
-    verify_kernel(built_kernel_path(args))
+    source = built_kernel_path(args)
+    verify_kernel(source, profile)
+    artifact = profile_artifact_path(args, profile)
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, artifact)
+    print(f"Wrote {profile.name} kernel artifact to {repo_path(artifact)}")
     return 0
 
 
 def install_local(args: argparse.Namespace) -> int:
-    source = args.kernel if args.kernel is not None else built_kernel_path(args)
-    verify_kernel(source)
-    destination = args.install_path.resolve(strict=False)
+    profile = profile_from_args(args)
+    source = args.kernel if args.kernel is not None else default_verify_source(args, profile)
+    verify_kernel(source, profile)
+    destination = install_destination(args, profile)
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
-    print(f"Installed {repo_path(source)} to {repo_path(destination)}")
+    print(f"Installed {profile.name} kernel {repo_path(source)} to {repo_path(destination)}")
     return 0
 
 
 def acceptance(args: argparse.Namespace) -> int:
+    profile = profile_from_args(args)
+    if profile.name == "apple":
+        raise SystemExit("acceptance requires the nbd or nbd-cifs profile")
     build(args)
     install_args = argparse.Namespace(**vars(args))
     install_args.kernel = built_kernel_path(args)
     install_local(install_args)
     env = os.environ.copy()
-    env["CAGE_TEST_KERNEL_PATH"] = str(args.install_path.resolve(strict=False))
+    env["CAGE_TEST_KERNEL_PATH"] = str(install_destination(args, profile))
     run(
         [
             "./tools/run",
@@ -474,6 +587,35 @@ def acceptance(args: argparse.Namespace) -> int:
         ],
         env=env,
     )
+    return 0
+
+
+def selected_create_profiles(args: argparse.Namespace) -> list[KernelProfile]:
+    requested = getattr(args, "profiles", None) or list(PROFILE_ORDER)
+    profiles = [KERNEL_PROFILES[name] for name in requested]
+    if getattr(args, "no_prepare", False) and len(profiles) > 1:
+        raise SystemExit("--no-prepare can only be used with a single --profile")
+    return profiles
+
+
+def create(args: argparse.Namespace) -> int:
+    for profile in selected_create_profiles(args):
+        build_args = argparse.Namespace(**vars(args))
+        build_args.profile = profile.name
+        build(build_args)
+        if getattr(args, "install_local", False):
+            install_args = argparse.Namespace(**vars(args))
+            install_args.profile = profile.name
+            install_args.kernel = profile_artifact_path(args, profile)
+            install_local(install_args)
+    return 0
+
+
+def list_profiles(_: argparse.Namespace) -> int:
+    for name in PROFILE_ORDER:
+        profile = KERNEL_PROFILES[name]
+        marker = " (default)" if name == DEFAULT_PROFILE_NAME else ""
+        print(f"{name}{marker}: {profile.description}")
     return 0
 
 
@@ -521,13 +663,19 @@ def diagnose_dns(args: argparse.Namespace) -> int:
 
 
 def validate_patch_file() -> None:
-    text = PATCH_PATH.read_text(encoding="utf-8")
-    missing = sorted(line for line in REQUIRED_CONFIG_LINES if line not in text)
-    if missing:
-        rendered = ", ".join(missing)
-        raise SystemExit(f"{repo_path(PATCH_PATH)} is missing required lines: {rendered}")
-    if "Sources/Containerization" in text or "Sources/" in text:
-        raise SystemExit(f"{repo_path(PATCH_PATH)} must be a kernel/config-arm64 patch only")
+    for profile in KERNEL_PROFILES.values():
+        for patch in profile.patches:
+            text = patch.path.read_text(encoding="utf-8")
+            missing = sorted(line for line in patch.required_config_lines if line not in text)
+            if missing:
+                rendered = ", ".join(missing)
+                raise SystemExit(
+                    f"{repo_path(patch.path)} is missing required lines: {rendered}"
+                )
+            if "Sources/Containerization" in text or "Sources/" in text:
+                raise SystemExit(
+                    f"{repo_path(patch.path)} must be a kernel/config-arm64 patch only"
+                )
 
 
 def self_test() -> int:
@@ -547,7 +695,18 @@ resolver #2
     sanitized = sanitize_nameservers(parsed)
     if sanitized != ["10.0.0.1", "2001:4860:4860::8888"]:
         raise AssertionError("failed to sanitize nameservers")
-    config = "\n".join(["# CONFIG_TEST=y", *sorted(REQUIRED_CONFIG_LINES), ""]) + "\n"
+    if profile_from_args(argparse.Namespace(profile="nbd-cifs")).name != "nbd-cifs":
+        raise AssertionError("failed to resolve default profile")
+    if [profile.name for profile in selected_create_profiles(argparse.Namespace(profiles=[]))] != [
+        *PROFILE_ORDER
+    ]:
+        raise AssertionError("failed to select default create profiles")
+    config = (
+        "\n".join(
+            ["# CONFIG_TEST=y", *sorted(KERNEL_PROFILES["nbd-cifs"].required_config_lines), ""]
+        )
+        + "\n"
+    )
     plain = b"prefix IKCFG_ST" + config.encode() + b"IKCFG_ED suffix"
     compressed = b"prefix IKCFG_ST" + gzip.compress(config.encode()) + b"IKCFG_ED suffix"
     stream = b"prefix" + gzip.compress(config.encode()) + b"suffix"
@@ -556,7 +715,9 @@ resolver #2
         for payload in (plain, compressed, stream):
             tmp.write_bytes(payload)
             found = read_kernel_config(tmp)
-            if found is None or not REQUIRED_CONFIG_LINES <= set(found.splitlines()):
+            if found is None or not KERNEL_PROFILES["nbd-cifs"].required_config_lines <= set(
+                found.splitlines()
+            ):
                 raise AssertionError("failed to extract synthetic kernel config")
     print("cage-kernel self-test passed")
     return 0
@@ -602,11 +763,36 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_CONTAINERIZATION_REVISION,
         help="upstream apple/containerization revision to build",
     )
+
+
+def add_profile_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_ORDER,
+        default=DEFAULT_PROFILE_NAME,
+        help=f"kernel profile to use, default: {DEFAULT_PROFILE_NAME}",
+    )
+
+
+def add_artifact_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--artifact-dir",
+        type=Path,
+        default=DEFAULT_ARTIFACT_DIR,
+        help="directory for created profile artifacts, default: .local/cage-kernel/kernels",
+    )
+
+
+def add_install_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--install-path",
         type=Path,
-        default=DEFAULT_INSTALL_PATH,
-        help="local Cage kernel install path",
+        default=None,
+        help=(
+            "exact local Cage kernel install path; by default nbd-cifs installs to "
+            "app/isolate/cage/.local/vmlinux and other profiles install under "
+            "app/isolate/cage/.local/kernels/<profile>/vmlinux"
+        ),
     )
 
 
@@ -616,11 +802,15 @@ def parser() -> argparse.ArgumentParser:
 
     prepare_command = subparsers.add_parser("prepare")
     add_common_options(prepare_command)
+    add_profile_option(prepare_command)
     prepare_command.set_defaults(handler=prepare)
 
     for name, handler in (("build", build), ("acceptance", acceptance)):
         command = subparsers.add_parser(name)
         add_common_options(command)
+        add_profile_option(command)
+        add_artifact_option(command)
+        add_install_options(command)
         command.add_argument(
             "--dns",
             action="append",
@@ -636,13 +826,51 @@ def parser() -> argparse.ArgumentParser:
 
     verify_command = subparsers.add_parser("verify")
     add_common_options(verify_command)
+    add_profile_option(verify_command)
+    add_artifact_option(verify_command)
     verify_command.add_argument("--kernel", type=Path, help="kernel image to verify")
     verify_command.set_defaults(handler=verify)
 
     install_command = subparsers.add_parser("install-local")
     add_common_options(install_command)
+    add_profile_option(install_command)
+    add_artifact_option(install_command)
+    add_install_options(install_command)
     install_command.add_argument("--kernel", type=Path, help="kernel image to install")
     install_command.set_defaults(handler=install_local)
+
+    create_command = subparsers.add_parser("create")
+    add_common_options(create_command)
+    add_artifact_option(create_command)
+    add_install_options(create_command)
+    create_command.add_argument(
+        "--profile",
+        action="append",
+        choices=PROFILE_ORDER,
+        dest="profiles",
+        default=[],
+        help="kernel profile to create; may be repeated; default: all profiles",
+    )
+    create_command.add_argument(
+        "--dns",
+        action="append",
+        default=[],
+        help="DNS nameserver IP to pass to Apple container; may be repeated",
+    )
+    create_command.add_argument(
+        "--no-prepare",
+        action="store_true",
+        help="reuse the existing prepared checkout; only valid with one --profile",
+    )
+    create_command.add_argument(
+        "--install-local",
+        action="store_true",
+        help="install each created profile for local Cage use",
+    )
+    create_command.set_defaults(handler=create)
+
+    list_command = subparsers.add_parser("list-profiles")
+    list_command.set_defaults(handler=list_profiles)
 
     diagnose_command = subparsers.add_parser("diagnose-dns")
     diagnose_command.add_argument(
