@@ -611,10 +611,7 @@ def valid_kernel_source_archive(source: Path) -> bool:
 
 def download_kernel_source(kernel: Path, source_url: str) -> None:
     tmp = kernel / "source.tar.xz.tmp"
-    try:
-        tmp.unlink()
-    except FileNotFoundError:
-        pass
+    tmp.unlink(missing_ok=True)
     try:
         run(
             [
@@ -630,10 +627,7 @@ def download_kernel_source(kernel: Path, source_url: str) -> None:
     except subprocess.CalledProcessError as exc:
         raise SystemExit(f"failed to download kernel source from {source_url}") from exc
     if not valid_kernel_source_archive(tmp):
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+        tmp.unlink(missing_ok=True)
         raise SystemExit(f"downloaded kernel source is not a valid .tar.xz archive: {source_url}")
     tmp.replace(kernel / "source.tar.xz")
 
@@ -824,10 +818,7 @@ def prepare_release_dir(release_dir: Path) -> None:
         *(profile_compressed_asset_name(KERNEL_PROFILES[name]) for name in PUBLISHED_PROFILE_ORDER),
     }
     for name in asset_names:
-        try:
-            (release_dir / name).unlink()
-        except FileNotFoundError:
-            pass
+        (release_dir / name).unlink(missing_ok=True)
 
 
 def package_release(args: argparse.Namespace) -> int:
@@ -1160,8 +1151,7 @@ resolver #2
     candidates = kernel_source_candidates(releases, "6.18")
     if candidates[:2] != [
         "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.37.tar.xz",
-        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/"
-        "snapshot/linux-6.18.37.tar.gz",
+        kernel_snapshot_url("6.18.37"),
     ]:
         raise AssertionError("failed to order latest non-EOL kernel source candidates")
     if profile_from_args(argparse.Namespace(profile=DEFAULT_PROFILE_NAME)).name != "hotplug":
