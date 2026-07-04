@@ -887,6 +887,18 @@ def publish(args: argparse.Namespace) -> int:
     assets = [str(path) for path in release_assets(release_dir)]
     if view.returncode == 0:
         run(["gh", "release", "upload", tag, "--repo", repo, "--clobber", *assets])
+        edit_command = [
+            "gh",
+            "release",
+            "edit",
+            tag,
+            "--repo",
+            repo,
+            f"--draft={str(args.draft).lower()}",
+        ]
+        if args.prerelease:
+            edit_command.append("--prerelease")
+        run(edit_command)
         return 0
     command = [
         "gh",
@@ -1154,6 +1166,15 @@ resolver #2
         kernel_snapshot_url("6.18.37"),
     ]:
         raise AssertionError("failed to order latest non-EOL kernel source candidates")
+    publish_defaults = parser().parse_args(["publish"])
+    if publish_defaults.draft:
+        raise AssertionError("publish must create full releases by default")
+    publish_draft = parser().parse_args(["publish", "--draft"])
+    if not publish_draft.draft:
+        raise AssertionError("publish --draft must request a draft release")
+    publish_no_draft = parser().parse_args(["publish", "--no-draft"])
+    if publish_no_draft.draft:
+        raise AssertionError("publish --no-draft must request a full release")
     if profile_from_args(argparse.Namespace(profile=DEFAULT_PROFILE_NAME)).name != "hotplug":
         raise AssertionError("failed to resolve default profile")
     if [profile.name for profile in selected_create_profiles(argparse.Namespace(profiles=[]))] != [
@@ -1394,8 +1415,8 @@ def parser() -> argparse.ArgumentParser:
     publish_command.add_argument(
         "--draft",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="create a draft release when the tag does not already exist, default: true",
+        default=False,
+        help="create or keep the release as a draft, default: false",
     )
     publish_command.add_argument(
         "--prerelease",
