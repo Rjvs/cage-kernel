@@ -2,14 +2,15 @@
 
 ## 0.3.0
 
-- Add explicit Cage kernel profiles for the stock Apple guest kernel, the Cage
-  NBD plus hotplug direct-volume kernel, and the Cage NBD plus hotplug plus
+- Add explicit Cage kernel profiles for the hotplug kernel that `Rjvs/cage-kernel`
+  already publishes, the NBD plus hotplug kernel, and the NBD plus hotplug plus
   SMB/CIFS kernel.
-- Add `create` and `list-profiles` commands so local workflows can build and
-  install the full kernel range instead of one implicit patched kernel.
-- Split the Containerization guest config patch into NBD and CIFS patches, and
-  skip a profile patch when the pinned upstream revision already carries its
-  required config.
+- Add `create`, `package-release`, `publish`, and `list-profiles` commands so
+  local workflows can build, package, publish, and install the full kernel range
+  instead of one implicit patched kernel.
+- Split the Containerization guest config patch into hotplug, NBD, and CIFS
+  patches, and skip a profile patch when the pinned upstream revision already
+  carries its required config.
 
 ## 0.2.0
 
