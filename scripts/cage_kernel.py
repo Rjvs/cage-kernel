@@ -18,7 +18,10 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.error
+import urllib.request
 import zlib
 from pathlib import Path
 
@@ -35,7 +38,8 @@ DEFAULT_ARTIFACT_DIR = DEFAULT_WORK_DIR / "kernels"
 DEFAULT_RELEASE_DIR = DEFAULT_WORK_DIR / "release"
 DEFAULT_INSTALL_DIR = REPO_ROOT / "app" / "isolate" / "cage" / ".local" / "kernels"
 DEFAULT_INSTALL_PATH = REPO_ROOT / "app" / "isolate" / "cage" / ".local" / "vmlinux"
-KERNEL_SOURCE_URL = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.5.tar.xz"
+KERNEL_RELEASES_URL = "https://www.kernel.org/releases.json"
+DEFAULT_KERNEL_SOURCE_SERIES = "6.18"
 KERNEL_BUILD_IMAGE = "kernel-build:0.1"
 KERNEL_BUILD_BASE_IMAGE = "ubuntu:focal"
 UBUNTU_DNS_PROBE_IMAGE = "ubuntu:focal"
@@ -464,6 +468,87 @@ def kernel_git_version(kernel: Path) -> str:
     return proc.stdout.strip() or "unknown"
 
 
+def version_key(version: str) -> tuple[int, ...]:
+    numeric = version.split("-", 1)[0]
+    return tuple(int(part) for part in numeric.split(".") if part.isdigit())
+
+
+def kernel_snapshot_url(version: str) -> str:
+    return (
+        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/"
+        f"snapshot/linux-{version}.tar.gz"
+    )
+
+
+def kernel_source_candidates(releases: list[object], series: str) -> list[str]:
+    prefix = f"{series}."
+    candidates: list[tuple[tuple[int, ...], int, str]] = []
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        if release.get("iseol") is True:
+            continue
+        if release.get("moniker") not in {"stable", "longterm"}:
+            continue
+        version = release.get("version")
+        source = release.get("source")
+        if not isinstance(version, str):
+            continue
+        if version != series and not version.startswith(prefix):
+            continue
+        key = version_key(version)
+        if isinstance(source, str) and (source.endswith(".tar.xz") or source.endswith(".tar.gz")):
+            candidates.append((key, 0, source))
+        candidates.append((key, 1, kernel_snapshot_url(version)))
+    return [url for _, _, url in sorted(candidates, key=lambda candidate: (candidate[0], -candidate[1]), reverse=True)]
+
+
+def source_url_available(url: str) -> bool:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "cage-kernel"},
+        method="HEAD",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return 200 <= response.status < 400
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def select_kernel_source_url(releases: list[object], series: str) -> str | None:
+    for candidate in kernel_source_candidates(releases, series):
+        if source_url_available(candidate):
+            return candidate
+    return None
+
+
+def kernel_releases() -> list[object]:
+    try:
+        with urllib.request.urlopen(KERNEL_RELEASES_URL, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"could not read {KERNEL_RELEASES_URL}: {exc}") from exc
+    releases = payload.get("releases") if isinstance(payload, dict) else None
+    if not isinstance(releases, list):
+        raise SystemExit(f"{KERNEL_RELEASES_URL} did not contain a releases list")
+    return releases
+
+
+def resolve_kernel_source_url(args: argparse.Namespace) -> str:
+    explicit = getattr(args, "kernel_source_url", None)
+    if explicit:
+        return explicit
+    series = getattr(args, "kernel_source_series", DEFAULT_KERNEL_SOURCE_SERIES)
+    selected = select_kernel_source_url(kernel_releases(), series)
+    if selected is None:
+        raise SystemExit(
+            f"kernel.org did not report a non-EOL stable/longterm {series} source tarball; "
+            "use --kernel-source-url to provide an explicit archive"
+        )
+    return selected
+
+
 def container_failure_output(exc: subprocess.CalledProcessError) -> str:
     output = exc.output if isinstance(exc.output, str) else ""
     stderr = exc.stderr if isinstance(exc.stderr, str) else ""
@@ -516,10 +601,51 @@ def build_kernel_image(kernel: Path, nameservers: list[str]) -> None:
     run_container(command, cwd=kernel)
 
 
-def ensure_kernel_source(kernel: Path) -> None:
+def valid_kernel_source_archive(source: Path) -> bool:
+    try:
+        with tarfile.open(source, "r:*") as archive:
+            return any(member.isfile() for member in archive)
+    except (OSError, tarfile.TarError):
+        return False
+
+
+def download_kernel_source(kernel: Path, source_url: str) -> None:
+    tmp = kernel / "source.tar.xz.tmp"
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        run(
+            [
+                "curl",
+                "-fL",
+                "--show-error",
+                "-o",
+                tmp.name,
+                source_url,
+            ],
+            cwd=kernel,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"failed to download kernel source from {source_url}") from exc
+    if not valid_kernel_source_archive(tmp):
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise SystemExit(f"downloaded kernel source is not a valid .tar.xz archive: {source_url}")
+    tmp.replace(kernel / "source.tar.xz")
+
+
+def ensure_kernel_source(kernel: Path, source_url: str) -> None:
     source = kernel / "source.tar.xz"
-    if not source.exists():
-        run(["curl", "-SsL", "-o", "source.tar.xz", KERNEL_SOURCE_URL], cwd=kernel)
+    if source.exists():
+        if valid_kernel_source_archive(source):
+            return
+        print(f"Removing invalid cached kernel source: {repo_path(source)}", file=sys.stderr)
+        source.unlink()
+    download_kernel_source(kernel, source_url)
 
 
 def run_kernel_build_with_image(kernel: Path, nameservers: list[str]) -> None:
@@ -650,6 +776,7 @@ def write_release_manifest(
     legacy_kernel: Path,
     containerization_url: str,
     containerization_revision: str,
+    kernel_source_url: str,
 ) -> None:
     manifest = {
         "schema_version": 1,
@@ -659,7 +786,7 @@ def write_release_manifest(
             "url": containerization_url,
             "revision": containerization_revision,
         },
-        "kernel_source_url": KERNEL_SOURCE_URL,
+        "kernel_source_url": kernel_source_url,
         "profiles": profile_entries,
         # Backwards-compatible shape consumed by current Cage releases.
         "artifacts": {
@@ -706,6 +833,7 @@ def prepare_release_dir(release_dir: Path) -> None:
 def package_release(args: argparse.Namespace) -> int:
     release_dir = release_dir_from_args(args)
     prepare_release_dir(release_dir)
+    kernel_source_url = resolve_kernel_source_url(args)
 
     profile_entries: dict[str, dict[str, object]] = {}
     legacy_kernel: Path | None = None
@@ -736,6 +864,7 @@ def package_release(args: argparse.Namespace) -> int:
         legacy_kernel=legacy_kernel,
         containerization_url=args.containerization_url,
         containerization_revision=args.containerization_revision,
+        kernel_source_url=kernel_source_url,
     )
     write_sha256sums(release_dir)
     print(f"Wrote cage-kernel release assets to {repo_path(release_dir)}")
@@ -800,9 +929,11 @@ def build(args: argparse.Namespace) -> int:
     nameservers = build_nameservers(args)
     rendered = ", ".join(nameservers) if nameservers else "container defaults"
     print(f"Using container DNS servers: {rendered}")
+    kernel_source_url = resolve_kernel_source_url(args)
+    print(f"Using kernel source: {kernel_source_url}")
     kernel = kernel_dir(args)
     try:
-        ensure_kernel_source(kernel)
+        ensure_kernel_source(kernel, kernel_source_url)
         try:
             build_kernel_image(kernel, nameservers)
         except subprocess.CalledProcessError as exc:
@@ -1000,6 +1131,39 @@ resolver #2
     )
     if is_container_service_failure(dns_failure):
         raise AssertionError("misclassified DNS failure as container service failure")
+    releases = [
+        {
+            "moniker": "longterm",
+            "version": "6.18.36",
+            "iseol": False,
+            "source": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.36.tar.xz",
+        },
+        {
+            "moniker": "longterm",
+            "version": "6.18.37",
+            "iseol": False,
+            "source": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.37.tar.xz",
+        },
+        {
+            "moniker": "mainline",
+            "version": "6.18.99-rc1",
+            "iseol": False,
+            "source": "https://example.invalid/linux-6.18.99-rc1.tar.gz",
+        },
+        {
+            "moniker": "longterm",
+            "version": "6.18.38",
+            "iseol": True,
+            "source": "https://example.invalid/linux-6.18.38.tar.xz",
+        },
+    ]
+    candidates = kernel_source_candidates(releases, "6.18")
+    if candidates[:2] != [
+        "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.37.tar.xz",
+        "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/"
+        "snapshot/linux-6.18.37.tar.gz",
+    ]:
+        raise AssertionError("failed to order latest non-EOL kernel source candidates")
     if profile_from_args(argparse.Namespace(profile=DEFAULT_PROFILE_NAME)).name != "hotplug":
         raise AssertionError("failed to resolve default profile")
     if [profile.name for profile in selected_create_profiles(argparse.Namespace(profiles=[]))] != [
@@ -1105,6 +1269,21 @@ def add_release_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_kernel_source_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--kernel-source-series",
+        default=DEFAULT_KERNEL_SOURCE_SERIES,
+        help=(
+            "kernel.org stable/longterm series to resolve dynamically, "
+            f"default: {DEFAULT_KERNEL_SOURCE_SERIES}"
+        ),
+    )
+    parser.add_argument(
+        "--kernel-source-url",
+        help="exact Linux kernel source tarball URL; overrides dynamic --kernel-source-series resolution",
+    )
+
+
 def add_install_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--install-path",
@@ -1133,6 +1312,7 @@ def parser() -> argparse.ArgumentParser:
         add_profile_option(command)
         add_artifact_option(command)
         add_install_options(command)
+        add_kernel_source_options(command)
         command.add_argument(
             "--dns",
             action="append",
@@ -1165,6 +1345,7 @@ def parser() -> argparse.ArgumentParser:
     add_common_options(create_command)
     add_artifact_option(create_command)
     add_install_options(create_command)
+    add_kernel_source_options(create_command)
     create_command.add_argument(
         "--profile",
         action="append",
@@ -1195,12 +1376,14 @@ def parser() -> argparse.ArgumentParser:
     add_common_options(package_command)
     add_artifact_option(package_command)
     add_release_options(package_command)
+    add_kernel_source_options(package_command)
     package_command.set_defaults(handler=package_release)
 
     publish_command = subparsers.add_parser("publish")
     add_common_options(publish_command)
     add_artifact_option(publish_command)
     add_release_options(publish_command)
+    add_kernel_source_options(publish_command)
     publish_command.add_argument(
         "--repo",
         default="Rjvs/cage-kernel",

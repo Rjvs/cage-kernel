@@ -86,11 +86,25 @@ selected profile patches. Commands that operate on one kernel accept
 `hotplug`.
 
 `build` runs `prepare`, then performs the same steps as the upstream
-`kernel/Makefile`: build the `kernel-build:0.1` image, download
-`source.tar.xz` from kernel.org when missing, run `build.sh` in the build
-container, and verify the resulting
+`kernel/Makefile`: build the `kernel-build:0.1` image, resolve the latest
+non-EOL kernel.org release in the configured source series, download and
+validate the source tarball when missing or corrupt, run `build.sh` in the
+build container, and verify the resulting
 `.local/cage-kernel/containerization/kernel/vmlinux`. The verified result is
 also copied to `.local/cage-kernel/kernels/<profile>/vmlinux`.
+
+The default source series is `6.18`, matching the Apple Containerization kernel
+series Cage tracks. `cage-kernel` first tries the source URL advertised by
+kernel.org release metadata, then falls back to the matching `git.kernel.org`
+stable snapshot if the CDN archive is not available. Override it when needed:
+
+```bash
+./tools/run --raw cage-kernel build --kernel-source-series 6.12
+./tools/run --raw cage-kernel build --kernel-source-url https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.37.tar.xz
+```
+
+HTTP errors and invalid cached downloads fail before the build container starts,
+so a stale kernel.org 404 response cannot be reused as the local source archive.
 
 `create` builds every kernel profile by default:
 
@@ -129,7 +143,7 @@ asset.
 ```bash
 ./tools/run cage-kernel publish
 ./tools/run cage-kernel publish -- --no-draft
-./tools/run cage-kernel publish -- --tag v0.3.0 --repo Rjvs/cage-kernel
+./tools/run cage-kernel publish -- --tag v0.3.2 --repo Rjvs/cage-kernel
 ```
 
 If the release tag already exists, `publish` uploads with `--clobber`. If it

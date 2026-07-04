@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2
+
+- Resolve the default Linux kernel source from kernel.org release metadata so
+  Cage tracks the latest non-EOL `6.18` source tarball instead of a stale point
+  release URL.
+- Download kernel sources with HTTP failure checks, validate cached
+  `source.tar.xz` archives before reuse, and replace invalid cached responses
+  before starting the build container.
+
 ## 0.3.1
 
 - Fail fast when the Apple `container` system service is unavailable instead of
