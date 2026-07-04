@@ -142,12 +142,14 @@ asset.
 
 ```bash
 ./tools/run cage-kernel publish
-./tools/run cage-kernel publish -- --no-draft
-./tools/run cage-kernel publish -- --tag v0.3.2 --repo Rjvs/cage-kernel
+./tools/run cage-kernel publish -- --draft
+./tools/run cage-kernel publish -- --tag v0.3.3 --repo Rjvs/cage-kernel
 ```
 
 If the release tag already exists, `publish` uploads with `--clobber`. If it
-does not exist, it creates a draft release by default.
+does not exist, it creates a full public release by default. Pass `--draft` only
+when intentionally staging a draft; rerunning `publish` without `--draft`
+publishes an existing draft release.
 
 On macOS, `build` first checks that the Apple `container` system service is
 running. If it is not available, start it before building:

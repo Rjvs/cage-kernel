@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3
+
+- Make `publish` create full GitHub releases by default instead of draft
+  releases, while retaining an explicit `--draft` option for staged releases.
+- When publishing to an existing release, update the release draft state so a
+  previous draft is published by a normal rerun.
+
 ## 0.3.2
 
 - Resolve the default Linux kernel source from kernel.org release metadata so
