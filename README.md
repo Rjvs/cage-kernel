@@ -1,93 +1,190 @@
 # Cage Kernel
 
-`cage-kernel` builds and publishes the macOS ContainerKit guest kernel used by
-Cage live direct-volume attach.
+## Purpose And Criticality
 
-Cage needs a guest kernel with SCSI disk, XHCI, USB mass storage, and UAS
-support so a hotplugged direct ext4 volume appears inside the VM. The upstream
-Apple Containerization framework has the host-side hotplug surface Cage needs,
-but the guest kernel config still needs this storage-driver patch until the
-options land upstream.
+`cage-kernel` is the reproducible build unit for macOS ContainerKit guest
+kernels used by Cage. Public release artifacts are published from
+[`Rjvs/cage-kernel`](https://github.com/Rjvs/cage-kernel); this monorepo copy
+remains the local development and compatibility reference.
 
-## Release Artifacts
+Cage can hotplug a direct ext4 volume into a running ContainerKit VM only when
+the guest kernel has SCSI disk, XHCI, USB mass storage, and UAS support. Cage
+can use guest-side NBD only when the kernel also has NBD support. Cage can
+mount SMB/Samba shares inside the guest only when the kernel also has CIFS
+support. The tool can create and publish three explicit profiles:
 
-GitHub Releases are the distribution channel. Each release publishes:
+| Profile | Description |
+|---------|-------------|
+| `hotplug` | Vanilla pinned `apple/containerization` guest kernel plus Cage's hotplug direct-volume config. This is the default profile and the backward-compatible `vmlinux.zst` release asset. |
+| `nbd` | `hotplug` plus guest-side NBD transport config. |
+| `nbd-cifs` | `nbd` plus SMB/CIFS guest-mount config. |
 
-- `vmlinux.zst` — zstd-compressed guest kernel.
-- `manifest.json` — build provenance, source revisions, hashes, and acceptance
-  status.
-- `SHA256SUMS` — checksums for `manifest.json` and `vmlinux.zst`.
+## What This Unit Ships
 
-Consumers must verify `SHA256SUMS`, verify the artifact hashes in
-`manifest.json`, decompress to a local `vmlinux` path, and verify the embedded
-kernel config before passing the path to ContainerKit.
+- `patches/containerization-hotplug-guest.patch`: the minimal
+  `kernel/config-arm64` patch for Cage hotplug direct-volume support.
+- `patches/containerization-nbd-guest.patch`: the minimal
+  `kernel/config-arm64` patch for Cage guest-side NBD transport support.
+- `patches/containerization-cifs-guest.patch`: the optional CIFS config patch
+  for upstream revisions that do not already carry the SMB/CIFS guest options.
+- `scripts/cage_kernel.py`: a managed workflow to fetch upstream
+  `apple/containerization`, apply profile patches, build `kernel/vmlinux`,
+  verify the embedded kernel config, create profile artifacts, package release
+  assets, publish them to `Rjvs/cage-kernel`, install them for Cage, and run the
+  focused live-volume acceptance test.
+- Unit metadata so the patch and workflow are visible through the normal repo
+  commands.
 
-## Requirements
+## Dependencies
 
 - macOS on Apple silicon.
 - Xcode command line tools.
-- Apple `container` CLI on `PATH`.
-- `zstd` on `PATH` for packaging.
-- Network access to clone `https://github.com/apple/containerization.git` and
-  download the Linux kernel source.
+- The Apple `container` CLI on `PATH`.
+- Network access to clone `https://github.com/apple/containerization.git`.
+- Cage's integration-test prerequisites when running `acceptance`.
 
 The default upstream revision is
-`25558e6b85251104b13d9ae91b5721c071052047`, matching Oja/Cage's current
+`25558e6b85251104b13d9ae91b5721c071052047`, matching Cage's current
 Containerization SwiftPM pin.
 
-## Commands
+## Repo Structure
+
+```text
+app/isolate/cage-kernel/
+  CHANGELOG.md
+  VERSION
+  patches/
+    containerization-cifs-guest.patch
+    containerization-hotplug-guest.patch
+    containerization-nbd-guest.patch
+  scripts/
+    cage_kernel.py
+```
+
+Generated checkouts and build products are written under
+`.local/cage-kernel/`, which is ignored by git.
+
+## Development Commands
 
 ```bash
-uv run --script scripts/cage_kernel.py prepare
-uv run --script scripts/cage_kernel.py build
-uv run --script scripts/cage_kernel.py verify
-uv run --script scripts/cage_kernel.py package
+./tools/run cage-kernel prepare
+./tools/run cage-kernel build
+./tools/run cage-kernel create
+./tools/run cage-kernel package-release
+./tools/run cage-kernel publish
+./tools/run cage-kernel verify
+./tools/run cage-kernel install-local
+./tools/run cage-kernel acceptance
+./tools/run cage-kernel list-profiles
+./tools/run --raw cage-kernel diagnose-dns
 ```
 
 `prepare` creates or refreshes `.local/cage-kernel/containerization`, checks out
-the pinned upstream revision, resets that managed checkout, and applies
-`patches/containerization-hotplug-guest.patch`.
+the pinned upstream revision, resets that managed checkout, and applies the
+selected profile patches. Commands that operate on one kernel accept
+`--profile hotplug`, `--profile nbd`, or `--profile nbd-cifs`; the default is
+`hotplug`.
 
-`build` runs `prepare`, then follows upstream's `kernel/Makefile` flow to build
-`.local/cage-kernel/containerization/kernel/vmlinux`.
+`build` runs `prepare`, then performs the same steps as the upstream
+`kernel/Makefile`: build the `kernel-build:0.1` image, download
+`source.tar.xz` from kernel.org when missing, run `build.sh` in the build
+container, and verify the resulting
+`.local/cage-kernel/containerization/kernel/vmlinux`. The verified result is
+also copied to `.local/cage-kernel/kernels/<profile>/vmlinux`.
 
-`verify` checks the embedded kernel config for the required live-attach options.
-
-`package` writes release artifacts to `dist/`.
-
-If automatic DNS discovery is wrong for your network, pass explicit DNS
-servers:
-
-```bash
-uv run --script scripts/cage_kernel.py build --dns 10.2.1.1
-```
-
-## Acceptance
-
-Acceptance runs against an Oja/Cage monorepo checkout because the integration
-test lives there:
+`create` builds every kernel profile by default:
 
 ```bash
-uv run --script scripts/cage_kernel.py acceptance --cage-repo /path/to/oja
+./tools/run cage-kernel create
+./tools/run cage-kernel create --profile hotplug --profile nbd --profile nbd-cifs
+./tools/run cage-kernel create --install-local
 ```
 
-The command builds and installs the kernel locally, then runs:
+`create --install-local` installs each profile for local Cage use. The default
+`hotplug` profile is installed at `app/isolate/cage/.local/vmlinux` for
+backwards compatibility. Other profiles install under
+`app/isolate/cage/.local/kernels/<profile>/vmlinux`.
+
+`package-release` packages existing profile artifacts from
+`.local/cage-kernel/kernels/<profile>/vmlinux` into
+`.local/cage-kernel/release/`:
+
+```text
+hotplug-vmlinux.zst
+nbd-vmlinux.zst
+nbd-cifs-vmlinux.zst
+vmlinux.zst
+manifest.json
+SHA256SUMS
+```
+
+`vmlinux.zst` is a backward-compatible alias for `hotplug-vmlinux.zst`, so
+current Cage release download code continues to consume the hotplug kernel. The
+manifest records all three profiles and keeps the existing top-level
+`artifacts.vmlinux` / `artifacts.vmlinux.zst` shape for that default hotplug
+asset.
+
+`publish` runs `package-release` and uploads the assets with GitHub CLI:
 
 ```bash
-./tools/repo/run cage test-integration-macos \
-  tests/integration/test_containerkit_live_volumes.py::TestContainerKitLiveVolumes::test_direct_ext4_volume_live_attach_persists
+./tools/run cage-kernel publish
+./tools/run cage-kernel publish -- --no-draft
+./tools/run cage-kernel publish -- --tag v0.3.0 --repo Rjvs/cage-kernel
 ```
 
-## Release Flow
+If the release tag already exists, `publish` uploads with `--clobber`. If it
+does not exist, it creates a draft release by default.
 
-1. PRs run script lint/self-test and patch validation.
-2. Tags matching `vX.Y.Z-rc.N` build and upload prerelease artifacts.
-3. Private QA installs that exact prerelease artifact and runs acceptance.
-4. The manual `Bless Release` workflow creates `vX.Y.Z` from the RC assets and
-   checksums; it does not rebuild a different kernel.
+On macOS, `build` discovers host DNS servers from `scutil --dns` and passes
+them to both `container build` and `container run` with `--dns`. This avoids a
+known Apple `container` failure mode where containers get `/etc/resolv.conf`
+pointing at the default NAT gateway, such as `192.168.73.1`, but that resolver
+cannot resolve `ports.ubuntu.com` for the Ubuntu package install in the build
+image.
 
-## Compatibility
+Some Apple `container` versions do not apply `container build --dns` to an
+already-running BuildKit builder. When the image build fails, `cage-kernel`
+falls back to a direct `ubuntu:focal` build container with the same package
+recipe and explicit DNS, without stopping, deleting, or recreating the global
+builder.
 
-This repo publishes a macOS-only binary artifact. It does not ship a runnable
-container image. Runtime consumers must materialize a local `vmlinux` file and
-pass that file path to Containerization.
+If automatic DNS discovery is wrong for your network, pass one or more explicit
+DNS servers:
+
+```bash
+./tools/run --raw cage-kernel build --dns 10.2.1.1
+./tools/run --raw cage-kernel acceptance --dns 10.2.1.1
+```
+
+`diagnose-dns` prints the discovered host DNS servers, Apple `container`
+service and builder status, and compares default container DNS with explicit
+host DNS:
+
+```bash
+./tools/run --raw cage-kernel diagnose-dns
+./tools/run --raw cage-kernel diagnose-dns --dns 10.2.1.1
+```
+
+`install-local` copies the verified kernel to the profile's local Cage path.
+For `hotplug`, that remains `app/isolate/cage/.local/vmlinux`, the
+source-checkout location Cage probes before the managed public-release cache.
+
+`acceptance` builds, installs, and runs the focused macOS live direct-volume
+integration test with `CAGE_TEST_KERNEL_PATH` set to the installed kernel. It is
+valid for all three profiles because each includes the hotplug storage config.
+
+## Compatibility Notes
+
+This unit is consumed by Cage on macOS only. It does not change the Cage public
+API and does not affect Windows/HCS.
+
+The patches are intentionally kernel-config-only. No Swift source edits to
+`apple/containerization` are required for Cage's current direct live-attach
+path; those belong to separate pod/shared-volume investigations.
+
+## Release Pointer
+
+Public releases are tagged in `Rjvs/cage-kernel` as `v{version}` and publish
+the three profile artifacts, the backward-compatible `vmlinux.zst` hotplug
+alias, `manifest.json`, and `SHA256SUMS`. The manifest records the upstream
+Containerization revision, profile requirements, and artifact hashes.

@@ -1,0 +1,13 @@
+diff --git a/kernel/config-arm64 b/kernel/config-arm64
+index c9c0c86..e1251bf 100644
+--- a/kernel/config-arm64
++++ b/kernel/config-arm64
+@@ -1814,7 +1814,7 @@ CONFIG_ZRAM_DEF_COMP="lzo-rle"
+ CONFIG_BLK_DEV_LOOP=y
+ CONFIG_BLK_DEV_LOOP_MIN_COUNT=8
+ # CONFIG_BLK_DEV_DRBD is not set
+-# CONFIG_BLK_DEV_NBD is not set
++CONFIG_BLK_DEV_NBD=y
+ CONFIG_BLK_DEV_RAM=y
+ CONFIG_BLK_DEV_RAM_COUNT=16
+ CONFIG_BLK_DEV_RAM_SIZE=16384

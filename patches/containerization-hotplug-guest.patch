@@ -1,5 +1,5 @@
 diff --git a/kernel/config-arm64 b/kernel/config-arm64
-index c9c0c864..67ec4296 100644
+index c9c0c86..2366e07 100644
 --- a/kernel/config-arm64
 +++ b/kernel/config-arm64
 @@ -1896,7 +1896,13 @@ CONFIG_VIRTIO_BLK=y

@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import argparse
 import compileall
+import dataclasses
 import gzip
 import hashlib
-import ipaddress
 import json
+import ipaddress
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -23,13 +23,18 @@ import zlib
 from pathlib import Path
 
 UNIT_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = UNIT_ROOT
+REPO_ROOT = UNIT_ROOT.parents[2]
 DEFAULT_WORK_DIR = REPO_ROOT / ".local" / "cage-kernel"
-DEFAULT_DIST_DIR = REPO_ROOT / "dist"
 DEFAULT_CONTAINERIZATION_URL = "https://github.com/apple/containerization.git"
 DEFAULT_CONTAINERIZATION_REVISION = "25558e6b85251104b13d9ae91b5721c071052047"
-PATCH_PATH = UNIT_ROOT / "patches" / "containerization-hotplug-guest.patch"
-DEFAULT_INSTALL_PATH = REPO_ROOT / ".local" / "vmlinux"
+HOTPLUG_PATCH_PATH = UNIT_ROOT / "patches" / "containerization-hotplug-guest.patch"
+NBD_PATCH_PATH = UNIT_ROOT / "patches" / "containerization-nbd-guest.patch"
+CIFS_PATCH_PATH = UNIT_ROOT / "patches" / "containerization-cifs-guest.patch"
+DEFAULT_PROFILE_NAME = "hotplug"
+DEFAULT_ARTIFACT_DIR = DEFAULT_WORK_DIR / "kernels"
+DEFAULT_RELEASE_DIR = DEFAULT_WORK_DIR / "release"
+DEFAULT_INSTALL_DIR = REPO_ROOT / "app" / "isolate" / "cage" / ".local" / "kernels"
+DEFAULT_INSTALL_PATH = REPO_ROOT / "app" / "isolate" / "cage" / ".local" / "vmlinux"
 KERNEL_SOURCE_URL = "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.5.tar.xz"
 KERNEL_BUILD_IMAGE = "kernel-build:0.1"
 KERNEL_BUILD_BASE_IMAGE = "ubuntu:focal"
@@ -55,7 +60,7 @@ LIVE_VOLUME_INTEGRATION_TEST = (
     "tests/integration/test_containerkit_live_volumes.py::"
     "TestContainerKitLiveVolumes::test_direct_ext4_volume_live_attach_persists"
 )
-REQUIRED_CONFIG_LINES = frozenset(
+HOTPLUG_CONFIG_LINES = frozenset(
     {
         "CONFIG_SCSI=y",
         "CONFIG_BLK_DEV_SD=y",
@@ -65,6 +70,63 @@ REQUIRED_CONFIG_LINES = frozenset(
         "CONFIG_USB_UAS=y",
     }
 )
+NBD_TRANSPORT_CONFIG_LINES = frozenset({"CONFIG_BLK_DEV_NBD=y"})
+NBD_CONFIG_LINES = NBD_TRANSPORT_CONFIG_LINES | HOTPLUG_CONFIG_LINES
+CIFS_CONFIG_LINES = frozenset(
+    {
+        "CONFIG_CIFS=y",
+        "CONFIG_CIFS_ALLOW_INSECURE_LEGACY=y",
+        "CONFIG_CIFS_UPCALL=y",
+        "CONFIG_CIFS_XATTR=y",
+        "CONFIG_CIFS_POSIX=y",
+        "CONFIG_CIFS_DFS_UPCALL=y",
+    }
+)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class KernelPatch:
+    path: Path
+    required_config_lines: frozenset[str]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class KernelProfile:
+    name: str
+    description: str
+    patches: tuple[KernelPatch, ...]
+    required_config_lines: frozenset[str]
+
+
+HOTPLUG_PATCH = KernelPatch(HOTPLUG_PATCH_PATH, HOTPLUG_CONFIG_LINES)
+NBD_PATCH = KernelPatch(NBD_PATCH_PATH, NBD_TRANSPORT_CONFIG_LINES)
+CIFS_PATCH = KernelPatch(CIFS_PATCH_PATH, CIFS_CONFIG_LINES)
+KERNEL_PROFILES = {
+    "hotplug": KernelProfile(
+        name="hotplug",
+        description="Apple guest kernel with Cage hotplug direct-volume support",
+        patches=(HOTPLUG_PATCH,),
+        required_config_lines=HOTPLUG_CONFIG_LINES,
+    ),
+    "nbd": KernelProfile(
+        name="nbd",
+        description="Apple guest kernel with Cage NBD and hotplug direct-volume support",
+        patches=(HOTPLUG_PATCH, NBD_PATCH),
+        required_config_lines=NBD_CONFIG_LINES,
+    ),
+    "nbd-cifs": KernelProfile(
+        name="nbd-cifs",
+        description="Cage NBD and hotplug direct-volume kernel with SMB/CIFS guest mounts",
+        patches=(HOTPLUG_PATCH, NBD_PATCH, CIFS_PATCH),
+        required_config_lines=NBD_CONFIG_LINES | CIFS_CONFIG_LINES,
+    ),
+}
+PROFILE_ORDER = ("hotplug", "nbd", "nbd-cifs")
+PUBLISHED_PROFILE_ORDER = PROFILE_ORDER
+LEGACY_RELEASE_PROFILE_NAME = "hotplug"
+LEGACY_COMPRESSED_ASSET = "vmlinux.zst"
+MANIFEST_ASSET = "manifest.json"
+SHA256SUMS_ASSET = "SHA256SUMS"
 
 
 def repo_path(path: Path) -> str:
@@ -117,6 +179,48 @@ def kernel_dir(args: argparse.Namespace) -> Path:
     return managed_checkout(args) / "kernel"
 
 
+def profile_from_args(args: argparse.Namespace) -> KernelProfile:
+    name = getattr(args, "profile", DEFAULT_PROFILE_NAME)
+    try:
+        return KERNEL_PROFILES[name]
+    except KeyError as exc:
+        choices = ", ".join(PROFILE_ORDER)
+        raise SystemExit(f"unknown kernel profile {name!r}; choose one of: {choices}") from exc
+
+
+def profile_artifact_path(args: argparse.Namespace, profile: KernelProfile) -> Path:
+    artifact_dir = getattr(args, "artifact_dir", None) or DEFAULT_ARTIFACT_DIR
+    return artifact_dir.resolve(strict=False) / profile.name / "vmlinux"
+
+
+def release_dir_from_args(args: argparse.Namespace) -> Path:
+    return (getattr(args, "release_dir", None) or DEFAULT_RELEASE_DIR).resolve(strict=False)
+
+
+def profile_compressed_asset_name(profile: KernelProfile) -> str:
+    return f"{profile.name}-vmlinux.zst"
+
+
+def default_install_path(profile: KernelProfile) -> Path:
+    if profile.name == DEFAULT_PROFILE_NAME:
+        return DEFAULT_INSTALL_PATH
+    return DEFAULT_INSTALL_DIR / profile.name / "vmlinux"
+
+
+def install_destination(args: argparse.Namespace, profile: KernelProfile) -> Path:
+    install_path = getattr(args, "install_path", None)
+    if install_path is not None:
+        return install_path.resolve(strict=False)
+    return default_install_path(profile).resolve(strict=False)
+
+
+def default_verify_source(args: argparse.Namespace, profile: KernelProfile) -> Path:
+    artifact = profile_artifact_path(args, profile)
+    if artifact.is_file():
+        return artifact
+    return built_kernel_path(args)
+
+
 def ensure_safe_work_dir(work_dir: Path) -> None:
     resolved = work_dir.resolve(strict=False)
     allowed_root = (REPO_ROOT / ".local").resolve()
@@ -134,12 +238,25 @@ def checkout_revision(checkout: Path, revision: str) -> None:
         run(["git", "checkout", "--detach", revision], cwd=checkout)
 
 
-def apply_hotplug_patch(checkout: Path) -> None:
-    run(["git", "apply", "--check", str(PATCH_PATH)], cwd=checkout)
-    run(["git", "apply", str(PATCH_PATH)], cwd=checkout)
+def checkout_config_lines(checkout: Path) -> set[str]:
+    config = checkout / "kernel" / "config-arm64"
+    try:
+        return set(config.read_text(encoding="utf-8").splitlines())
+    except OSError as exc:
+        raise SystemExit(f"could not read {repo_path(config)}: {exc}") from exc
+
+
+def apply_profile_patches(checkout: Path, profile: KernelProfile) -> None:
+    for patch in profile.patches:
+        if patch.required_config_lines <= checkout_config_lines(checkout):
+            print(f"Skipping {repo_path(patch.path)}; required config is already present")
+            continue
+        run(["git", "apply", "--check", str(patch.path)], cwd=checkout)
+        run(["git", "apply", str(patch.path)], cwd=checkout)
 
 
 def prepare(args: argparse.Namespace) -> int:
+    profile = profile_from_args(args)
     ensure_safe_work_dir(args.work_dir)
     args.work_dir.mkdir(parents=True, exist_ok=True)
     checkout = managed_checkout(args)
@@ -161,8 +278,11 @@ def prepare(args: argparse.Namespace) -> int:
     checkout_revision(checkout, args.containerization_revision)
     run(["git", "reset", "--hard", args.containerization_revision], cwd=checkout)
     run(["git", "clean", "-fdx"], cwd=checkout)
-    apply_hotplug_patch(checkout)
-    print(f"Prepared {repo_path(checkout)} at {args.containerization_revision}")
+    apply_profile_patches(checkout, profile)
+    print(
+        f"Prepared {repo_path(checkout)} at {args.containerization_revision} "
+        f"for {profile.name}"
+    )
     return 0
 
 
@@ -202,126 +322,24 @@ def kernel_config_lines(kernel: Path) -> set[str]:
     return set(config.splitlines())
 
 
-def verify_kernel(kernel: Path) -> None:
+def verify_kernel(kernel: Path, profile: KernelProfile) -> None:
     if not kernel.is_file():
         raise SystemExit(f"kernel image not found: {repo_path(kernel)}")
     options = kernel_config_lines(kernel)
-    missing = sorted(REQUIRED_CONFIG_LINES - options)
+    missing = sorted(profile.required_config_lines - options)
     if missing:
         rendered = ", ".join(missing)
-        raise SystemExit(f"{repo_path(kernel)} is missing required config: {rendered}")
-    print(f"{repo_path(kernel)} supports Cage live volume attach")
+        raise SystemExit(
+            f"{repo_path(kernel)} does not satisfy profile {profile.name!r}; "
+            f"missing required config: {rendered}"
+        )
+    print(f"{repo_path(kernel)} satisfies Cage kernel profile {profile.name}")
 
 
 def verify(args: argparse.Namespace) -> int:
-    kernel = args.kernel if args.kernel is not None else built_kernel_path(args)
-    verify_kernel(kernel.resolve(strict=False))
-    return 0
-
-
-def product_version() -> str:
-    return (UNIT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def write_sha256sums(dist_dir: Path, entries: dict[str, str]) -> None:
-    lines = [f"{digest}  {name}\n" for name, digest in sorted(entries.items())]
-    (dist_dir / "SHA256SUMS").write_text("".join(lines), encoding="utf-8")
-
-
-def git_revision() -> str:
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError:
-        return "unknown"
-    return proc.stdout.strip() or "unknown"
-
-
-def compress_kernel(source: Path, destination: Path) -> None:
-    if shutil.which("zstd") is None:
-        raise SystemExit("`zstd` is required to package vmlinux.zst")
-    run(["zstd", "-q", "-f", "-19", "-o", str(destination), str(source)])
-
-
-def package(args: argparse.Namespace) -> int:
-    source = args.kernel if args.kernel is not None else built_kernel_path(args)
-    source = source.resolve(strict=False)
-    verify_kernel(source)
-
-    dist_dir = args.dist_dir.resolve(strict=False)
-    dist_dir.mkdir(parents=True, exist_ok=True)
-    compressed = dist_dir / "vmlinux.zst"
-    manifest_path = dist_dir / "manifest.json"
-
-    compress_kernel(source, compressed)
-
-    manifest = {
-        "schema_version": 1,
-        "name": "cage-kernel",
-        "version": product_version(),
-        "git_revision": git_revision(),
-        "containerization": {
-            "url": args.containerization_url,
-            "revision": args.containerization_revision,
-        },
-        "linux_source": {
-            "url": KERNEL_SOURCE_URL,
-            "version": KERNEL_SOURCE_URL.rsplit("/", 1)[-1]
-            .removeprefix("linux-")
-            .removesuffix(".tar.xz"),
-        },
-        "patch": {
-            "path": "patches/containerization-hotplug-guest.patch",
-            "sha256": sha256_file(PATCH_PATH),
-        },
-        "artifacts": {
-            "vmlinux": {
-                "path": "vmlinux",
-                "sha256": sha256_file(source),
-                "size": source.stat().st_size,
-            },
-            "vmlinux.zst": {
-                "path": "vmlinux.zst",
-                "sha256": sha256_file(compressed),
-                "size": compressed.stat().st_size,
-                "compression": "zstd",
-            },
-        },
-        "build": {
-            "system": platform.system(),
-            "machine": platform.machine(),
-            "runner": os.environ.get("GITHUB_RUNNER_NAME", ""),
-            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
-            "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
-            "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
-        },
-        "acceptance": {
-            "command": args.acceptance_command,
-            "result": args.acceptance_result,
-        },
-    }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    write_sha256sums(
-        dist_dir,
-        {
-            "manifest.json": sha256_file(manifest_path),
-            "vmlinux.zst": sha256_file(compressed),
-        },
-    )
-    print(f"Packaged release artifacts in {repo_path(dist_dir)}")
+    profile = profile_from_args(args)
+    kernel = args.kernel if args.kernel is not None else default_verify_source(args, profile)
+    verify_kernel(kernel.resolve(strict=False), profile)
     return 0
 
 
@@ -520,7 +538,206 @@ def run_kernel_build_direct(kernel: Path, nameservers: list[str]) -> None:
     run(command, cwd=kernel)
 
 
+def unit_version() -> str:
+    return (UNIT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def compress_kernel(source: Path, destination: Path) -> None:
+    if shutil.which("zstd") is None:
+        raise SystemExit("`zstd` CLI is required to package cage-kernel release assets")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    run(
+        [
+            "zstd",
+            "-19",
+            "--force",
+            "--quiet",
+            "-o",
+            str(destination),
+            str(source),
+        ]
+    )
+
+
+def release_profile_entry(
+    profile: KernelProfile,
+    *,
+    kernel: Path,
+    compressed: Path,
+) -> dict[str, object]:
+    return {
+        "description": profile.description,
+        "required_config": sorted(profile.required_config_lines),
+        "artifacts": {
+            "vmlinux": {
+                "sha256": file_sha256(kernel),
+                "size": kernel.stat().st_size,
+            },
+            "vmlinux.zst": {
+                "name": compressed.name,
+                "sha256": file_sha256(compressed),
+                "size": compressed.stat().st_size,
+            },
+        },
+    }
+
+
+def write_release_manifest(
+    release_dir: Path,
+    profile_entries: dict[str, dict[str, object]],
+    *,
+    legacy_compressed: Path,
+    legacy_kernel: Path,
+    containerization_url: str,
+    containerization_revision: str,
+) -> None:
+    manifest = {
+        "schema_version": 1,
+        "version": unit_version(),
+        "default_profile": LEGACY_RELEASE_PROFILE_NAME,
+        "containerization": {
+            "url": containerization_url,
+            "revision": containerization_revision,
+        },
+        "kernel_source_url": KERNEL_SOURCE_URL,
+        "profiles": profile_entries,
+        # Backwards-compatible shape consumed by current Cage releases.
+        "artifacts": {
+            "vmlinux": {
+                "profile": LEGACY_RELEASE_PROFILE_NAME,
+                "sha256": file_sha256(legacy_kernel),
+                "size": legacy_kernel.stat().st_size,
+            },
+            "vmlinux.zst": {
+                "profile": LEGACY_RELEASE_PROFILE_NAME,
+                "name": LEGACY_COMPRESSED_ASSET,
+                "sha256": file_sha256(legacy_compressed),
+                "size": legacy_compressed.stat().st_size,
+            },
+        },
+    }
+    payload = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    (release_dir / MANIFEST_ASSET).write_bytes(payload)
+
+
+def write_sha256sums(release_dir: Path) -> None:
+    assets = sorted(
+        path for path in release_dir.iterdir() if path.is_file() and path.name != SHA256SUMS_ASSET
+    )
+    lines = [f"{file_sha256(path)}  {path.name}\n" for path in assets]
+    (release_dir / SHA256SUMS_ASSET).write_text("".join(lines), encoding="utf-8")
+
+
+def prepare_release_dir(release_dir: Path) -> None:
+    release_dir.mkdir(parents=True, exist_ok=True)
+    asset_names = {
+        MANIFEST_ASSET,
+        SHA256SUMS_ASSET,
+        LEGACY_COMPRESSED_ASSET,
+        *(profile_compressed_asset_name(KERNEL_PROFILES[name]) for name in PUBLISHED_PROFILE_ORDER),
+    }
+    for name in asset_names:
+        try:
+            (release_dir / name).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def package_release(args: argparse.Namespace) -> int:
+    release_dir = release_dir_from_args(args)
+    prepare_release_dir(release_dir)
+
+    profile_entries: dict[str, dict[str, object]] = {}
+    legacy_kernel: Path | None = None
+    legacy_compressed: Path | None = None
+    for name in PUBLISHED_PROFILE_ORDER:
+        profile = KERNEL_PROFILES[name]
+        kernel = profile_artifact_path(args, profile)
+        verify_kernel(kernel, profile)
+        compressed = release_dir / profile_compressed_asset_name(profile)
+        compress_kernel(kernel, compressed)
+        profile_entries[profile.name] = release_profile_entry(
+            profile,
+            kernel=kernel,
+            compressed=compressed,
+        )
+        if profile.name == LEGACY_RELEASE_PROFILE_NAME:
+            legacy_kernel = kernel
+            legacy_compressed = release_dir / LEGACY_COMPRESSED_ASSET
+            shutil.copy2(compressed, legacy_compressed)
+
+    if legacy_kernel is None or legacy_compressed is None:
+        raise SystemExit(f"release package must include {LEGACY_RELEASE_PROFILE_NAME!r}")
+
+    write_release_manifest(
+        release_dir,
+        profile_entries,
+        legacy_compressed=legacy_compressed,
+        legacy_kernel=legacy_kernel,
+        containerization_url=args.containerization_url,
+        containerization_revision=args.containerization_revision,
+    )
+    write_sha256sums(release_dir)
+    print(f"Wrote cage-kernel release assets to {repo_path(release_dir)}")
+    return 0
+
+
+def release_assets(release_dir: Path) -> list[Path]:
+    return sorted(path for path in release_dir.iterdir() if path.is_file())
+
+
+def publish(args: argparse.Namespace) -> int:
+    if shutil.which("gh") is None:
+        raise SystemExit("`gh` CLI is required to publish cage-kernel releases")
+    package_release(args)
+    release_dir = release_dir_from_args(args)
+    tag = args.tag or f"v{unit_version()}"
+    repo = args.repo
+    title = args.title or f"cage-kernel {unit_version()}"
+    notes = args.notes or (
+        "Cage ContainerKit guest kernels: hotplug, nbd, and nbd-cifs profiles."
+    )
+    view = subprocess.run(
+        ["gh", "release", "view", tag, "--repo", repo],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assets = [str(path) for path in release_assets(release_dir)]
+    if view.returncode == 0:
+        run(["gh", "release", "upload", tag, "--repo", repo, "--clobber", *assets])
+        return 0
+    command = [
+        "gh",
+        "release",
+        "create",
+        tag,
+        "--repo",
+        repo,
+        "--title",
+        title,
+        "--notes",
+        notes,
+    ]
+    if args.draft:
+        command.append("--draft")
+    if args.prerelease:
+        command.append("--prerelease")
+    run([*command, *assets])
+    return 0
+
+
 def build(args: argparse.Namespace) -> int:
+    profile = profile_from_args(args)
     if shutil.which("container") is None:
         raise SystemExit(
             "`container` CLI is required to build apple/containerization/kernel"
@@ -548,41 +765,72 @@ def build(args: argparse.Namespace) -> int:
     except subprocess.CalledProcessError as exc:
         report_container_dns_failure(exc, nameservers)
         raise
-    verify_kernel(built_kernel_path(args))
+    source = built_kernel_path(args)
+    verify_kernel(source, profile)
+    artifact = profile_artifact_path(args, profile)
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, artifact)
+    print(f"Wrote {profile.name} kernel artifact to {repo_path(artifact)}")
     return 0
 
 
 def install_local(args: argparse.Namespace) -> int:
-    source = args.kernel if args.kernel is not None else built_kernel_path(args)
-    verify_kernel(source)
-    destination = args.install_path.resolve(strict=False)
+    profile = profile_from_args(args)
+    source = args.kernel if args.kernel is not None else default_verify_source(args, profile)
+    verify_kernel(source, profile)
+    destination = install_destination(args, profile)
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
-    print(f"Installed {repo_path(source)} to {repo_path(destination)}")
+    print(f"Installed {profile.name} kernel {repo_path(source)} to {repo_path(destination)}")
     return 0
 
 
 def acceptance(args: argparse.Namespace) -> int:
+    profile = profile_from_args(args)
     build(args)
     install_args = argparse.Namespace(**vars(args))
     install_args.kernel = built_kernel_path(args)
     install_local(install_args)
     env = os.environ.copy()
-    env["CAGE_TEST_KERNEL_PATH"] = str(args.install_path.resolve(strict=False))
-    cage_repo = args.cage_repo or os.environ.get("CAGE_REPO")
-    if not cage_repo:
-        raise SystemExit("acceptance requires --cage-repo or CAGE_REPO")
-    cage_repo_path = Path(cage_repo).expanduser().resolve(strict=False)
+    env["CAGE_TEST_KERNEL_PATH"] = str(install_destination(args, profile))
     run(
         [
-            str(cage_repo_path / "tools" / "repo" / "run"),
+            "./tools/run",
             "cage",
             "test-integration-macos",
             LIVE_VOLUME_INTEGRATION_TEST,
         ],
-        cwd=cage_repo_path,
         env=env,
     )
+    return 0
+
+
+def selected_create_profiles(args: argparse.Namespace) -> list[KernelProfile]:
+    requested = getattr(args, "profiles", None) or list(PROFILE_ORDER)
+    profiles = [KERNEL_PROFILES[name] for name in requested]
+    if getattr(args, "no_prepare", False) and len(profiles) > 1:
+        raise SystemExit("--no-prepare can only be used with a single --profile")
+    return profiles
+
+
+def create(args: argparse.Namespace) -> int:
+    for profile in selected_create_profiles(args):
+        build_args = argparse.Namespace(**vars(args))
+        build_args.profile = profile.name
+        build(build_args)
+        if getattr(args, "install_local", False):
+            install_args = argparse.Namespace(**vars(args))
+            install_args.profile = profile.name
+            install_args.kernel = profile_artifact_path(args, profile)
+            install_local(install_args)
+    return 0
+
+
+def list_profiles(_: argparse.Namespace) -> int:
+    for name in PROFILE_ORDER:
+        profile = KERNEL_PROFILES[name]
+        marker = " (default)" if name == DEFAULT_PROFILE_NAME else ""
+        print(f"{name}{marker}: {profile.description}")
     return 0
 
 
@@ -630,13 +878,19 @@ def diagnose_dns(args: argparse.Namespace) -> int:
 
 
 def validate_patch_file() -> None:
-    text = PATCH_PATH.read_text(encoding="utf-8")
-    missing = sorted(line for line in REQUIRED_CONFIG_LINES if line not in text)
-    if missing:
-        rendered = ", ".join(missing)
-        raise SystemExit(f"{repo_path(PATCH_PATH)} is missing required lines: {rendered}")
-    if "Sources/Containerization" in text or "Sources/" in text:
-        raise SystemExit(f"{repo_path(PATCH_PATH)} must be a kernel/config-arm64 patch only")
+    for profile in KERNEL_PROFILES.values():
+        for patch in profile.patches:
+            text = patch.path.read_text(encoding="utf-8")
+            missing = sorted(line for line in patch.required_config_lines if line not in text)
+            if missing:
+                rendered = ", ".join(missing)
+                raise SystemExit(
+                    f"{repo_path(patch.path)} is missing required lines: {rendered}"
+                )
+            if "Sources/Containerization" in text or "Sources/" in text:
+                raise SystemExit(
+                    f"{repo_path(patch.path)} must be a kernel/config-arm64 patch only"
+                )
 
 
 def self_test() -> int:
@@ -656,7 +910,26 @@ resolver #2
     sanitized = sanitize_nameservers(parsed)
     if sanitized != ["10.0.0.1", "2001:4860:4860::8888"]:
         raise AssertionError("failed to sanitize nameservers")
-    config = "\n".join(["# CONFIG_TEST=y", *sorted(REQUIRED_CONFIG_LINES), ""]) + "\n"
+    if profile_from_args(argparse.Namespace(profile=DEFAULT_PROFILE_NAME)).name != "hotplug":
+        raise AssertionError("failed to resolve default profile")
+    if [profile.name for profile in selected_create_profiles(argparse.Namespace(profiles=[]))] != [
+        *PROFILE_ORDER
+    ]:
+        raise AssertionError("failed to select default create profiles")
+    for profile_name in ("hotplug", "nbd", "nbd-cifs"):
+        if not HOTPLUG_CONFIG_LINES <= KERNEL_PROFILES[profile_name].required_config_lines:
+            raise AssertionError(f"{profile_name} profile is missing hotplug config")
+    if NBD_TRANSPORT_CONFIG_LINES <= KERNEL_PROFILES["hotplug"].required_config_lines:
+        raise AssertionError("hotplug profile must not include NBD transport config")
+    for profile_name in ("nbd", "nbd-cifs"):
+        if not NBD_TRANSPORT_CONFIG_LINES <= KERNEL_PROFILES[profile_name].required_config_lines:
+            raise AssertionError(f"{profile_name} profile is missing NBD transport config")
+    config = (
+        "\n".join(
+            ["# CONFIG_TEST=y", *sorted(KERNEL_PROFILES["nbd-cifs"].required_config_lines), ""]
+        )
+        + "\n"
+    )
     plain = b"prefix IKCFG_ST" + config.encode() + b"IKCFG_ED suffix"
     compressed = b"prefix IKCFG_ST" + gzip.compress(config.encode()) + b"IKCFG_ED suffix"
     stream = b"prefix" + gzip.compress(config.encode()) + b"suffix"
@@ -665,7 +938,9 @@ resolver #2
         for payload in (plain, compressed, stream):
             tmp.write_bytes(payload)
             found = read_kernel_config(tmp)
-            if found is None or not REQUIRED_CONFIG_LINES <= set(found.splitlines()):
+            if found is None or not KERNEL_PROFILES["nbd-cifs"].required_config_lines <= set(
+                found.splitlines()
+            ):
                 raise AssertionError("failed to extract synthetic kernel config")
     print("cage-kernel self-test passed")
     return 0
@@ -711,11 +986,45 @@ def add_common_options(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_CONTAINERIZATION_REVISION,
         help="upstream apple/containerization revision to build",
     )
+
+
+def add_profile_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_ORDER,
+        default=DEFAULT_PROFILE_NAME,
+        help=f"kernel profile to use, default: {DEFAULT_PROFILE_NAME}",
+    )
+
+
+def add_artifact_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--artifact-dir",
+        type=Path,
+        default=DEFAULT_ARTIFACT_DIR,
+        help="directory for created profile artifacts, default: .local/cage-kernel/kernels",
+    )
+
+
+def add_release_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--release-dir",
+        type=Path,
+        default=DEFAULT_RELEASE_DIR,
+        help="directory for packaged release assets, default: .local/cage-kernel/release",
+    )
+
+
+def add_install_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--install-path",
         type=Path,
-        default=DEFAULT_INSTALL_PATH,
-        help="local Cage kernel install path",
+        default=None,
+        help=(
+            "exact local Cage kernel install path; by default hotplug installs to "
+            "app/isolate/cage/.local/vmlinux and other profiles install under "
+            "app/isolate/cage/.local/kernels/<profile>/vmlinux"
+        ),
     )
 
 
@@ -725,11 +1034,15 @@ def parser() -> argparse.ArgumentParser:
 
     prepare_command = subparsers.add_parser("prepare")
     add_common_options(prepare_command)
+    add_profile_option(prepare_command)
     prepare_command.set_defaults(handler=prepare)
 
     for name, handler in (("build", build), ("acceptance", acceptance)):
         command = subparsers.add_parser(name)
         add_common_options(command)
+        add_profile_option(command)
+        add_artifact_option(command)
+        add_install_options(command)
         command.add_argument(
             "--dns",
             action="append",
@@ -741,48 +1054,95 @@ def parser() -> argparse.ArgumentParser:
             action="store_true",
             help="reuse the existing prepared checkout",
         )
-        if name == "acceptance":
-            command.add_argument(
-                "--cage-repo",
-                type=Path,
-                help="Oja monorepo checkout used to run Cage integration acceptance",
-            )
         command.set_defaults(handler=handler)
 
     verify_command = subparsers.add_parser("verify")
     add_common_options(verify_command)
+    add_profile_option(verify_command)
+    add_artifact_option(verify_command)
     verify_command.add_argument("--kernel", type=Path, help="kernel image to verify")
     verify_command.set_defaults(handler=verify)
 
     install_command = subparsers.add_parser("install-local")
     add_common_options(install_command)
+    add_profile_option(install_command)
+    add_artifact_option(install_command)
+    add_install_options(install_command)
     install_command.add_argument("--kernel", type=Path, help="kernel image to install")
     install_command.set_defaults(handler=install_local)
 
-    for name in ("package", "release-manifest"):
-        package_command = subparsers.add_parser(name)
-        add_common_options(package_command)
-        package_command.add_argument("--kernel", type=Path, help="kernel image to package")
-        package_command.add_argument(
-            "--dist-dir",
-            type=Path,
-            default=DEFAULT_DIST_DIR,
-            help="release artifact output directory, default: dist",
-        )
-        package_command.add_argument(
-            "--acceptance-command",
-            default=(
-                "./tools/repo/run cage test-integration-macos "
-                f"{LIVE_VOLUME_INTEGRATION_TEST}"
-            ),
-            help="acceptance command recorded in manifest.json",
-        )
-        package_command.add_argument(
-            "--acceptance-result",
-            default="not_run",
-            help="acceptance result recorded in manifest.json",
-        )
-        package_command.set_defaults(handler=package)
+    create_command = subparsers.add_parser("create")
+    add_common_options(create_command)
+    add_artifact_option(create_command)
+    add_install_options(create_command)
+    create_command.add_argument(
+        "--profile",
+        action="append",
+        choices=PROFILE_ORDER,
+        dest="profiles",
+        default=[],
+        help="kernel profile to create; may be repeated; default: all profiles",
+    )
+    create_command.add_argument(
+        "--dns",
+        action="append",
+        default=[],
+        help="DNS nameserver IP to pass to Apple container; may be repeated",
+    )
+    create_command.add_argument(
+        "--no-prepare",
+        action="store_true",
+        help="reuse the existing prepared checkout; only valid with one --profile",
+    )
+    create_command.add_argument(
+        "--install-local",
+        action="store_true",
+        help="install each created profile for local Cage use",
+    )
+    create_command.set_defaults(handler=create)
+
+    package_command = subparsers.add_parser("package-release")
+    add_common_options(package_command)
+    add_artifact_option(package_command)
+    add_release_options(package_command)
+    package_command.set_defaults(handler=package_release)
+
+    publish_command = subparsers.add_parser("publish")
+    add_common_options(publish_command)
+    add_artifact_option(publish_command)
+    add_release_options(publish_command)
+    publish_command.add_argument(
+        "--repo",
+        default="Rjvs/cage-kernel",
+        help="GitHub repository to publish to, default: Rjvs/cage-kernel",
+    )
+    publish_command.add_argument(
+        "--tag",
+        help="release tag, default: v<VERSION>",
+    )
+    publish_command.add_argument(
+        "--title",
+        help="release title, default: cage-kernel <VERSION>",
+    )
+    publish_command.add_argument(
+        "--notes",
+        help="release notes",
+    )
+    publish_command.add_argument(
+        "--draft",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="create a draft release when the tag does not already exist, default: true",
+    )
+    publish_command.add_argument(
+        "--prerelease",
+        action="store_true",
+        help="mark a newly-created release as prerelease",
+    )
+    publish_command.set_defaults(handler=publish)
+
+    list_command = subparsers.add_parser("list-profiles")
+    list_command.set_defaults(handler=list_profiles)
 
     diagnose_command = subparsers.add_parser("diagnose-dns")
     diagnose_command.add_argument(
