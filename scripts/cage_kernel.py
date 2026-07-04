@@ -56,9 +56,8 @@ LIVE_VOLUME_INTEGRATION_TEST = (
     "tests/integration/test_containerkit_live_volumes.py::"
     "TestContainerKitLiveVolumes::test_direct_ext4_volume_live_attach_persists"
 )
-NBD_CONFIG_LINES = frozenset(
+HOTPLUG_CONFIG_LINES = frozenset(
     {
-        "CONFIG_BLK_DEV_NBD=y",
         "CONFIG_SCSI=y",
         "CONFIG_BLK_DEV_SD=y",
         "CONFIG_USB=y",
@@ -67,6 +66,8 @@ NBD_CONFIG_LINES = frozenset(
         "CONFIG_USB_UAS=y",
     }
 )
+NBD_TRANSPORT_CONFIG_LINES = frozenset({"CONFIG_BLK_DEV_NBD=y"})
+NBD_CONFIG_LINES = NBD_TRANSPORT_CONFIG_LINES | HOTPLUG_CONFIG_LINES
 CIFS_CONFIG_LINES = frozenset(
     {
         "CONFIG_CIFS=y",
@@ -104,13 +105,13 @@ KERNEL_PROFILES = {
     ),
     "nbd": KernelProfile(
         name="nbd",
-        description="Apple guest kernel with Cage NBD/direct-volume support",
+        description="Apple guest kernel with Cage NBD and hotplug direct-volume support",
         patches=(NBD_PATCH,),
         required_config_lines=NBD_CONFIG_LINES,
     ),
     "nbd-cifs": KernelProfile(
         name="nbd-cifs",
-        description="Cage NBD/direct-volume kernel with SMB/CIFS guest mounts",
+        description="Cage NBD and hotplug direct-volume kernel with SMB/CIFS guest mounts",
         patches=(NBD_PATCH, CIFS_PATCH),
         required_config_lines=NBD_CONFIG_LINES | CIFS_CONFIG_LINES,
     ),
@@ -701,6 +702,9 @@ resolver #2
         *PROFILE_ORDER
     ]:
         raise AssertionError("failed to select default create profiles")
+    for profile_name in ("nbd", "nbd-cifs"):
+        if not HOTPLUG_CONFIG_LINES <= KERNEL_PROFILES[profile_name].required_config_lines:
+            raise AssertionError(f"{profile_name} profile is missing hotplug config")
     config = (
         "\n".join(
             ["# CONFIG_TEST=y", *sorted(KERNEL_PROFILES["nbd-cifs"].required_config_lines), ""]

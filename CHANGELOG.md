@@ -3,7 +3,8 @@
 ## 0.3.0
 
 - Add explicit Cage kernel profiles for the stock Apple guest kernel, the Cage
-  NBD/direct-volume kernel, and the Cage NBD plus SMB/CIFS kernel.
+  NBD plus hotplug direct-volume kernel, and the Cage NBD plus hotplug plus
+  SMB/CIFS kernel.
 - Add `create` and `list-profiles` commands so local workflows can build and
   install the full kernel range instead of one implicit patched kernel.
 - Split the Containerization guest config patch into NBD and CIFS patches, and

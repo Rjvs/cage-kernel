@@ -15,13 +15,14 @@ CIFS support. The tool can create three explicit profiles:
 | Profile | Description |
 |---------|-------------|
 | `apple` | Stock pinned `apple/containerization` guest kernel with no Cage patch. |
-| `nbd` | Apple guest kernel plus Cage's NBD/direct-volume config. |
-| `nbd-cifs` | `nbd` plus SMB/CIFS guest-mount config. This is the default Cage local kernel profile. |
+| `nbd` | Apple guest kernel plus Cage's NBD transport and hotplug direct-volume config. |
+| `nbd-cifs` | `nbd` plus SMB/CIFS guest-mount config; it retains the same hotplug direct-volume config. This is the default Cage local kernel profile. |
 
 ## What This Unit Ships
 
 - `patches/containerization-nbd-guest.patch`: the minimal
-  `kernel/config-arm64` patch for Cage NBD/direct-volume support.
+  `kernel/config-arm64` patch for Cage NBD transport and hotplug
+  direct-volume support.
 - `patches/containerization-cifs-guest.patch`: the optional CIFS config patch
   for upstream revisions that do not already carry the SMB/CIFS guest options.
 - `scripts/cage_kernel.py`: a managed workflow to fetch upstream
