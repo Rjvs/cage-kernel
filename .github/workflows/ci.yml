@@ -44,7 +44,7 @@ jobs:
       - name: Package artifacts
         run: uv run --script scripts/cage_kernel.py package --acceptance-result not_run
       - name: Upload release artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           prerelease: true
           files: |
