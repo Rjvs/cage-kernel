@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.4
+
+- Rebase all guest-kernel profiles on Apple Containerization 0.38.0 commit
+  `d9868bb657fac3b55ed5dcec97c8eb8a08e78bf5` while retaining Cage's hotplug
+  and NBD configuration deltas.
+- Require every published profile to keep `CONFIG_VSOCKETS_LOOPBACK` unset;
+  Containerization 0.38 already satisfies the optional CIFS profile settings.
+- Consume 0.38's renamed `kernel/vmlinux-arm64` build output while preserving
+  Cage's stable `vmlinux` profile and release asset names.
+- Preserve validated kernel-source downloads outside the cleaned upstream
+  checkout so building all three release profiles reuses one source archive.
+
 ## 0.3.3
 
 - Make `publish` create full GitHub releases by default instead of draft

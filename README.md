@@ -28,7 +28,7 @@ support. The tool can create and publish three explicit profiles:
 - `patches/containerization-cifs-guest.patch`: the optional CIFS config patch
   for upstream revisions that do not already carry the SMB/CIFS guest options.
 - `scripts/cage_kernel.py`: a managed workflow to fetch upstream
-  `apple/containerization`, apply profile patches, build `kernel/vmlinux`,
+  `apple/containerization`, apply profile patches, build `kernel/vmlinux-arm64`,
   verify the embedded kernel config, create profile artifacts, package release
   assets, publish them to `Rjvs/cage-kernel`, install them for Cage, and run the
   focused live-volume acceptance test.
@@ -44,7 +44,7 @@ support. The tool can create and publish three explicit profiles:
 - Cage's integration-test prerequisites when running `acceptance`.
 
 The default upstream revision is
-`25558e6b85251104b13d9ae91b5721c071052047`, matching Cage's current
+`d9868bb657fac3b55ed5dcec97c8eb8a08e78bf5`, matching Cage's current
 Containerization SwiftPM pin.
 
 ## Repo Structure
@@ -90,7 +90,7 @@ selected profile patches. Commands that operate on one kernel accept
 non-EOL kernel.org release in the configured source series, download and
 validate the source tarball when missing or corrupt, run `build.sh` in the
 build container, and verify the resulting
-`.local/cage-kernel/containerization/kernel/vmlinux`. The verified result is
+`.local/cage-kernel/containerization/kernel/vmlinux-arm64`. The verified result is
 also copied to `.local/cage-kernel/kernels/<profile>/vmlinux`.
 
 The default source series is `6.18`, matching the Apple Containerization kernel
@@ -105,6 +105,9 @@ stable snapshot if the CDN archive is not available. Override it when needed:
 
 HTTP errors and invalid cached downloads fail before the build container starts,
 so a stale kernel.org 404 response cannot be reused as the local source archive.
+Validated source archives are cached outside the managed upstream checkout and
+copied back after each profile prepare, avoiding a fresh download when
+`git clean` resets the checkout between profile builds.
 
 `create` builds every kernel profile by default:
 
@@ -201,7 +204,10 @@ valid for all three profiles because each includes the hotplug storage config.
 This unit is consumed by Cage on macOS only. It does not change the Cage public
 API and does not affect Windows/HCS.
 
-The patches are intentionally kernel-config-only. No Swift source edits to
+The patches are intentionally kernel-config-only. Every published profile also
+verifies that `CONFIG_VSOCKETS_LOOPBACK` is unset. Containerization 0.38 already
+carries Cage's CIFS requirements, so the CIFS patch is retained only for older
+compatible revisions and is skipped for the production revision. No Swift source edits to
 `apple/containerization` are required for Cage's current direct live-attach
 path; those belong to separate pod/shared-volume investigations.
 

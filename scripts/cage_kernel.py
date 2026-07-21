@@ -29,7 +29,7 @@ UNIT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = UNIT_ROOT.parents[2]
 DEFAULT_WORK_DIR = REPO_ROOT / ".local" / "cage-kernel"
 DEFAULT_CONTAINERIZATION_URL = "https://github.com/apple/containerization.git"
-DEFAULT_CONTAINERIZATION_REVISION = "25558e6b85251104b13d9ae91b5721c071052047"
+DEFAULT_CONTAINERIZATION_REVISION = "d9868bb657fac3b55ed5dcec97c8eb8a08e78bf5"
 HOTPLUG_PATCH_PATH = UNIT_ROOT / "patches" / "containerization-hotplug-guest.patch"
 NBD_PATCH_PATH = UNIT_ROOT / "patches" / "containerization-nbd-guest.patch"
 CIFS_PATCH_PATH = UNIT_ROOT / "patches" / "containerization-cifs-guest.patch"
@@ -79,6 +79,7 @@ HOTPLUG_CONFIG_LINES = frozenset(
         "CONFIG_USB_UAS=y",
     }
 )
+RUNTIME_SECURITY_CONFIG_LINES = frozenset({"# CONFIG_VSOCKETS_LOOPBACK is not set"})
 NBD_TRANSPORT_CONFIG_LINES = frozenset({"CONFIG_BLK_DEV_NBD=y"})
 NBD_CONFIG_LINES = NBD_TRANSPORT_CONFIG_LINES | HOTPLUG_CONFIG_LINES
 CIFS_CONFIG_LINES = frozenset(
@@ -115,19 +116,19 @@ KERNEL_PROFILES = {
         name="hotplug",
         description="Apple guest kernel with Cage hotplug direct-volume support",
         patches=(HOTPLUG_PATCH,),
-        required_config_lines=HOTPLUG_CONFIG_LINES,
+        required_config_lines=HOTPLUG_CONFIG_LINES | RUNTIME_SECURITY_CONFIG_LINES,
     ),
     "nbd": KernelProfile(
         name="nbd",
         description="Apple guest kernel with Cage NBD and hotplug direct-volume support",
         patches=(HOTPLUG_PATCH, NBD_PATCH),
-        required_config_lines=NBD_CONFIG_LINES,
+        required_config_lines=NBD_CONFIG_LINES | RUNTIME_SECURITY_CONFIG_LINES,
     ),
     "nbd-cifs": KernelProfile(
         name="nbd-cifs",
         description="Cage NBD and hotplug direct-volume kernel with SMB/CIFS guest mounts",
         patches=(HOTPLUG_PATCH, NBD_PATCH, CIFS_PATCH),
-        required_config_lines=NBD_CONFIG_LINES | CIFS_CONFIG_LINES,
+        required_config_lines=NBD_CONFIG_LINES | CIFS_CONFIG_LINES | RUNTIME_SECURITY_CONFIG_LINES,
     ),
 }
 PROFILE_ORDER = ("hotplug", "nbd", "nbd-cifs")
@@ -205,7 +206,7 @@ def managed_checkout(args: argparse.Namespace) -> Path:
 
 
 def built_kernel_path(args: argparse.Namespace) -> Path:
-    return managed_checkout(args) / "kernel" / "vmlinux"
+    return managed_checkout(args) / "kernel" / "vmlinux-arm64"
 
 
 def kernel_dir(args: argparse.Namespace) -> Path:
@@ -609,8 +610,14 @@ def valid_kernel_source_archive(source: Path) -> bool:
         return False
 
 
-def download_kernel_source(kernel: Path, source_url: str) -> None:
-    tmp = kernel / "source.tar.xz.tmp"
+def kernel_source_cache_path(args: argparse.Namespace, source_url: str) -> Path:
+    source_id = hashlib.sha256(source_url.encode("utf-8")).hexdigest()
+    return args.work_dir.resolve() / "sources" / f"{source_id}.tar.xz"
+
+
+def download_kernel_source(destination: Path, source_url: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_name(f"{destination.name}.tmp")
     tmp.unlink(missing_ok=True)
     try:
         run(
@@ -619,27 +626,33 @@ def download_kernel_source(kernel: Path, source_url: str) -> None:
                 "-fL",
                 "--show-error",
                 "-o",
-                tmp.name,
+                str(tmp),
                 source_url,
-            ],
-            cwd=kernel,
+            ]
         )
     except subprocess.CalledProcessError as exc:
         raise SystemExit(f"failed to download kernel source from {source_url}") from exc
     if not valid_kernel_source_archive(tmp):
         tmp.unlink(missing_ok=True)
         raise SystemExit(f"downloaded kernel source is not a valid .tar.xz archive: {source_url}")
-    tmp.replace(kernel / "source.tar.xz")
+    tmp.replace(destination)
 
 
-def ensure_kernel_source(kernel: Path, source_url: str) -> None:
+def ensure_kernel_source(args: argparse.Namespace, kernel: Path, source_url: str) -> None:
+    cached = kernel_source_cache_path(args, source_url)
+    if cached.exists() and not valid_kernel_source_archive(cached):
+        print(f"Removing invalid cached kernel source: {repo_path(cached)}", file=sys.stderr)
+        cached.unlink()
+    if not cached.exists():
+        download_kernel_source(cached, source_url)
+
     source = kernel / "source.tar.xz"
     if source.exists():
         if valid_kernel_source_archive(source):
             return
         print(f"Removing invalid cached kernel source: {repo_path(source)}", file=sys.stderr)
         source.unlink()
-    download_kernel_source(kernel, source_url)
+    shutil.copy2(cached, source)
 
 
 def run_kernel_build_with_image(kernel: Path, nameservers: list[str]) -> None:
@@ -936,7 +949,7 @@ def build(args: argparse.Namespace) -> int:
     print(f"Using kernel source: {kernel_source_url}")
     kernel = kernel_dir(args)
     try:
-        ensure_kernel_source(kernel, kernel_source_url)
+        ensure_kernel_source(args, kernel, kernel_source_url)
         try:
             build_kernel_image(kernel, nameservers)
         except subprocess.CalledProcessError as exc:
@@ -1184,6 +1197,8 @@ resolver #2
     for profile_name in ("hotplug", "nbd", "nbd-cifs"):
         if not HOTPLUG_CONFIG_LINES <= KERNEL_PROFILES[profile_name].required_config_lines:
             raise AssertionError(f"{profile_name} profile is missing hotplug config")
+        if not RUNTIME_SECURITY_CONFIG_LINES <= KERNEL_PROFILES[profile_name].required_config_lines:
+            raise AssertionError(f"{profile_name} profile permits vsock loopback")
     if NBD_TRANSPORT_CONFIG_LINES <= KERNEL_PROFILES["hotplug"].required_config_lines:
         raise AssertionError("hotplug profile must not include NBD transport config")
     for profile_name in ("nbd", "nbd-cifs"):
