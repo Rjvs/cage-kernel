@@ -8,6 +8,13 @@ release_tags = ["cage-kernel/v{version}"]
 
 [publish]
 kind = "command"
+command = [
+    "uv",
+    "run",
+    "--script",
+    "app/isolate/cage-kernel/scripts/cage_kernel.py",
+    "publish",
+]
 
 [ci]
 pr_runners = ["self-hosted-linux"]
