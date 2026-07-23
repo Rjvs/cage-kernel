@@ -6,6 +6,9 @@ path = "app/isolate/cage-kernel"
 version_file = "VERSION"
 release_tags = ["cage-kernel/v{version}"]
 
+[publish]
+kind = "command"
+
 [ci]
 pr_runners = ["self-hosted-linux"]
 platform_agnostic = true
